@@ -1,0 +1,26 @@
+# personal-agent runtime config (template — copy to config.yml and fill in)
+# config.yml is gitignored; never commit live credentials or room IDs.
+
+# Polling cadence and chunking.
+poll_interval_seconds: 5
+max_message_length: 4000
+
+# Logical Matrix room the agent watches. Override per-deployment.
+room_id: "!ROOMID:your.homeserver"
+
+# Operator mxid — only messages from this sender are processed. Other senders
+# are silently dropped at the gate (security flag B in dispatcher.py).
+operator_user_id: "@your-user:your.homeserver"
+
+# claude-code project directory the agent runs from.
+project_dir: "/home/user/.claude/projects/personal-agent"
+
+# Claude subprocess timeout (seconds). Personal-agent conversations can run
+# longer than dispatcher tasks; default is generous.
+subprocess_timeout_seconds: 1800
+
+# Retention for session metadata in SQLite (days).
+session_retention_days: 30
+
+# Optional: post a startup notification to the room when the manager comes up.
+startup_notify: true
