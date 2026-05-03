@@ -48,10 +48,12 @@ from nio import AsyncClient, RoomMessageText, SyncResponse
 _room_lock: asyncio.Lock | None = None  # set lazily in main()
 _active_processes: dict[str, asyncio.subprocess.Process] = {}
 _last_spawn_at: float = 0.0
+_last_cleanup_at: float = 0.0
 _handlers: set[asyncio.Task] = set()
 
 DEFAULT_SUBPROCESS_TIMEOUT = 1800
 RATE_LIMIT_SECONDS = 5
+CLEANUP_INTERVAL_SECONDS = 3600
 
 # ---------------------------------------------------------------------------
 # Logging — structured, no message body content
@@ -193,6 +195,16 @@ def register_alias(
     db.commit()
 
 
+def cleanup_old_sessions(db: sqlite3.Connection, retention_days: int) -> None:
+    cutoff = int(time.time()) - (retention_days * 86400)
+    with db:
+        deleted = db.execute(
+            "DELETE FROM sessions WHERE last_message_at < ?", (cutoff,)
+        ).rowcount
+    if deleted:
+        log.info("action=session_cleanup deleted=%d retention_days=%d", deleted, retention_days)
+
+
 # ---------------------------------------------------------------------------
 # Credentials — assert at startup
 # ---------------------------------------------------------------------------
@@ -324,7 +336,11 @@ async def _run_claude(
     rc = proc.returncode if proc.returncode is not None else -1
     stdout = stdout_b.decode(errors="replace").strip()
     stderr = stderr_b.decode(errors="replace").strip()
-    output = stdout if rc == 0 else stderr[:500]
+    if rc == 0:
+        output = stdout
+    else:
+        log.error("action=claude_error rc=%d stderr=%s", rc, stderr)
+        output = f"[Error: claude exited with code {rc}]"
     return rc, output
 
 
@@ -449,6 +465,13 @@ async def handle_event(
 
     user_message = (event.body or "").strip()
     if not user_message:
+        return
+    if len(user_message) > 32_000:
+        await post_message(
+            client, room_id,
+            f"Message too long ({len(user_message):,} chars, limit is 32,000).",
+            reply_to=event.event_id,
+        )
         return
     thread_root = extract_thread_root(event)
     mention = operator_user_id  # @ted mention on first chunk
@@ -608,6 +631,13 @@ async def poll_loop(
                 continue
             since = resp.next_batch
             set_since(db, since)
+
+            global _last_cleanup_at
+            now_ts = time.time()
+            if now_ts - _last_cleanup_at > CLEANUP_INTERVAL_SECONDS:
+                retention_days = int(config.get("session_retention_days", 30))
+                cleanup_old_sessions(db, retention_days)
+                _last_cleanup_at = now_ts
 
             for joined_room_id, room_info in resp.rooms.join.items():
                 if joined_room_id != room_id:
