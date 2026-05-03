@@ -48,11 +48,13 @@ from nio import AsyncClient, RoomMessageText, SyncResponse
 _room_lock: asyncio.Lock | None = None  # set lazily in main()
 _active_processes: dict[str, asyncio.subprocess.Process] = {}
 _last_spawn_at: float = 0.0
+_last_resume_at: float = 0.0
 _last_cleanup_at: float = 0.0
 _handlers: set[asyncio.Task] = set()
 
 DEFAULT_SUBPROCESS_TIMEOUT = 1800
 RATE_LIMIT_SECONDS = 5
+RESUME_RATE_LIMIT_SECONDS = 3
 CLEANUP_INTERVAL_SECONDS = 3600
 
 # ---------------------------------------------------------------------------
@@ -488,6 +490,12 @@ async def handle_event(
                 short_id,
                 (time.time() - row["created_at"]) / 60.0,
             )
+            queue_depth = len(_handlers)
+            if queue_depth > 3:
+                log.warning(
+                    "action=handler_queue_depth depth=%d session_id=%s",
+                    queue_depth, short_id,
+                )
             ack_event_id = await post_message(
                 client, room_id,
                 f"Thinking... (session {short_id})",
@@ -495,6 +503,22 @@ async def handle_event(
             )
             register_alias(db, ack_event_id, thread_root_id)
             async with _room_lock:
+                global _last_resume_at
+                now = time.time()
+                if now - _last_resume_at < RESUME_RATE_LIMIT_SECONDS:
+                    remaining = int(RESUME_RATE_LIMIT_SECONDS - (now - _last_resume_at))
+                    log.info(
+                        "action=resume_rate_limited session_id=%s wait_s=%d",
+                        short_id, remaining,
+                    )
+                    rate_event_id = await post_message(
+                        client, room_id,
+                        f"{mention} Still processing — retry in {remaining}s.",
+                        reply_to=ack_event_id or event.event_id,
+                    )
+                    register_alias(db, rate_event_id, thread_root_id)
+                    return
+                _last_resume_at = now
                 start = time.time()
                 try:
                     rc, output = await resume_personal(
