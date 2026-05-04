@@ -29,5 +29,9 @@ session_retention_days: 30
 idle_threshold_seconds: 1800
 idle_check_interval_seconds: 60
 
+# v0.3 — context window size used as the denominator for token_fill_pct.
+# Sized for the current Claude context window; lift if Anthropic ships a larger one.
+context_window_tokens: 200000
+
 # Optional: post a startup notification to the room when the manager comes up.
 startup_notify: true

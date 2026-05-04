@@ -69,6 +69,7 @@ _last_cleanup_at: float = 0.0
 _handlers: set[asyncio.Task] = set()
 
 DEFAULT_SUBPROCESS_TIMEOUT = 1800
+DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
 RATE_LIMIT_SECONDS = 5
 RESUME_RATE_LIMIT_SECONDS = 3
 CLEANUP_INTERVAL_SECONDS = 3600
@@ -515,26 +516,45 @@ def read_last_n_turns(
     return result
 
 
-def get_token_fill_pct(session_id: str, project_dir: str) -> float:
-    """Estimate context fill from cumulative input tokens in JSONL transcript.
-    Sonnet context window: 200k tokens. Returns 0.0–1.0."""
+def get_token_fill_pct(
+    session_id: str,
+    project_dir: str,
+    context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
+) -> float:
+    """Estimate context fill from the latest transcript entry's usage.
+    Returns 0.0–1.0.
+
+    Claude Code uses prompt caching, so per-turn `input_tokens` reflects only new
+    content; the bulk of context lives in `cache_read_input_tokens` and
+    `cache_creation_input_tokens`. The true fill at any moment is the sum of
+    those three on the latest entry that carries usage. Reverse-scan the file
+    and break on the first such entry."""
     transcript = transcripts_dir(project_dir) / f"{session_id}.jsonl"
     if not transcript.exists():
         return 0.0
-    total_input = 0
     try:
-        for line in transcript.read_text(errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            usage = (obj.get("message") or {}).get("usage") or {}
-            total_input += usage.get("input_tokens", 0)
+        lines = transcript.read_text(errors="replace").splitlines()
     except OSError:
         return 0.0
-    return min(total_input / 200_000, 1.0)
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        usage = (obj.get("message") or {}).get("usage") or {}
+        if not usage:
+            continue
+        total = (
+            usage.get("input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+        )
+        if total <= 0:
+            continue
+        return min(total / context_window, 1.0)
+    return 0.0
 
 
 def idle_threshold_for_fill(token_fill_pct: float) -> int:
@@ -571,10 +591,13 @@ def should_rollover(row: sqlite3.Row, now: float) -> tuple[bool, str, int]:
 
 
 def update_token_fill(
-    db: sqlite3.Connection, session_id: str, project_dir: str
+    db: sqlite3.Connection,
+    session_id: str,
+    project_dir: str,
+    context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
 ) -> float:
     """Read transcript, update token_fill_pct in sessions table, return new value."""
-    fill = get_token_fill_pct(session_id, project_dir)
+    fill = get_token_fill_pct(session_id, project_dir, context_window)
     with db:
         db.execute(
             "UPDATE sessions SET token_fill_pct=? WHERE session_id=?",
@@ -607,6 +630,7 @@ async def trigger_rollover(
     subprocess_timeout: int,
     threshold: int,
     trigger: str = "idle",
+    context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
 ) -> str | None:
     """Generate handoff, retire old session, allocate new session_id (do NOT
     spawn). Returns new_session_id on success, None on failure (old session
@@ -619,16 +643,40 @@ async def trigger_rollover(
     short_id = session_id[:8]
     log.info("action=rollover_start session_id=%s trigger=%s", short_id, trigger)
     async with _room_lock:
-        # M1: recheck freshness under lock — a user message may have arrived
-        # and updated last_message_at between snapshot and lock-acquire.
+        # Recheck the trigger-specific condition under the lock. A user message
+        # may have arrived between snapshot and lock-acquire, but for
+        # token_budget and age_cap that doesn't disqualify the rollover — only
+        # the idle trigger cares about freshness.
         fresh = db.execute(
-            "SELECT last_message_at, status FROM sessions WHERE session_id = ?",
+            "SELECT last_message_at, created_at, status FROM sessions "
+            "WHERE session_id = ?",
             (session_id,),
         ).fetchone()
-        if (not fresh or fresh["status"] != "active"
-                or fresh["last_message_at"] >= int(time.time()) - threshold):
-            log.info("action=rollover_skip_stale session_id=%s", short_id)
+        if not fresh or fresh["status"] != "active":
+            log.info("action=rollover_skip_stale session_id=%s reason=inactive",
+                     short_id)
             return None
+        now_int = int(time.time())
+        if trigger == "idle":
+            if fresh["last_message_at"] >= now_int - threshold:
+                log.info("action=rollover_skip_stale session_id=%s reason=idle_reset",
+                         short_id)
+                return None
+        elif trigger == "token_budget":
+            current_fill = get_token_fill_pct(session_id, project_dir, context_window)
+            if current_fill < 0.80:
+                log.info(
+                    "action=rollover_skip_stale session_id=%s reason=fill_drop fill=%.3f",
+                    short_id, current_fill,
+                )
+                return None
+        elif trigger == "age_cap":
+            if now_int - fresh["created_at"] <= 86400:
+                log.info(
+                    "action=rollover_skip_stale session_id=%s reason=age_drop",
+                    short_id,
+                )
+                return None
 
         try:
             rc, handoff_text = await resume_personal(
@@ -694,6 +742,9 @@ async def idle_monitor(
     subprocess_timeout = int(config.get(
         "subprocess_timeout_seconds", DEFAULT_SUBPROCESS_TIMEOUT
     ))
+    context_window = int(config.get(
+        "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS
+    ))
     log.info("action=idle_monitor_start interval_s=%d mode=dynamic_triggers", interval)
     while True:
         try:
@@ -716,6 +767,7 @@ async def idle_monitor(
                         subprocess_timeout=subprocess_timeout,
                         threshold=threshold,
                         trigger=trigger,
+                        context_window=context_window,
                     )
         except asyncio.CancelledError:
             raise
@@ -800,6 +852,7 @@ async def handle_event(
     db: sqlite3.Connection,
     max_message_length: int,
     subprocess_timeout: int,
+    context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
 ) -> None:
     global _last_spawn_at, _room_lock
     assert _room_lock is not None
@@ -941,7 +994,7 @@ async def handle_event(
                     register_alias(db, timeout_event_id, thread_root_id)
                     return
                 touch_session(db, session_id)
-                update_token_fill(db, session_id, project_dir)
+                update_token_fill(db, session_id, project_dir, context_window)
                 log.info(
                     "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
                     short_id, rc, time.time() - start,
@@ -1004,7 +1057,7 @@ async def handle_event(
             )
             register_alias(db, timeout_event_id, event.event_id)
             return
-        update_token_fill(db, session_id, project_dir)
+        update_token_fill(db, session_id, project_dir, context_window)
         log.info(
             "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
             short_id, rc, time.time() - start,
@@ -1033,6 +1086,9 @@ async def poll_loop(
     project_dir = config["project_dir"]
     subprocess_timeout = int(config.get(
         "subprocess_timeout_seconds", DEFAULT_SUBPROCESS_TIMEOUT
+    ))
+    context_window = int(config.get(
+        "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS
     ))
 
     since = get_since(db)
@@ -1085,6 +1141,7 @@ async def poll_loop(
                         db=db,
                         max_message_length=max_message_length,
                         subprocess_timeout=subprocess_timeout,
+                        context_window=context_window,
                     ))
                     _handlers.add(task)
                     task.add_done_callback(_handlers.discard)
