@@ -8,8 +8,17 @@ v0.1 scope:
   - Structured logs (no message body content)
   - Posts response chunks back to Matrix with @ted mention on first chunk
 
+v0.2 scope (added):
+  - Background idle monitor — sessions idle past idle_threshold_seconds are
+    rolled over: handoff summary generated via the live session, written to
+    handoffs/<session_id>.md, old session marked retired, new session_id
+    allocated against the same thread_root.
+  - Continuity injection — first user message after rollover is spawned (not
+    resumed) with the handoff text and last-10 transcript turns prepended.
+  - Multiple sessions per Matrix thread (status='active' filter); thread_root_id
+    no longer UNIQUE in sessions; event_aliases FK dropped (FK requires UNIQUE).
+
 Future phases extend this file:
-  v0.2 — idle rollover with handoff injection
   v0.3 — token-fill / age triggers
   v0.4 — typing indicators + cold-start memsearch injection
   v0.5 — task-queue delegation + agent-bus event subscription
@@ -30,6 +39,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -73,7 +83,9 @@ log = logging.getLogger("personal-agent")
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).parent / "config.yml"
-DB_PATH = Path.home() / ".claude" / "data" / "personal-agent" / "sessions.db"
+DATA_DIR = Path.home() / ".claude" / "data" / "personal-agent"
+DB_PATH = DATA_DIR / "sessions.db"
+HANDOFFS_DIR = DATA_DIR / "handoffs"
 
 
 def load_config() -> dict:
@@ -98,11 +110,20 @@ def open_db() -> sqlite3.Connection:
     return db
 
 
+def _sessions_has_unique_thread_root(db: sqlite3.Connection) -> bool:
+    row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
+    ).fetchone()
+    return bool(row) and "UNIQUE" in (row["sql"] or "")
+
+
 def init_db(db: sqlite3.Connection) -> None:
+    # Fresh-install path. CREATE IF NOT EXISTS preserves any prior schema —
+    # the migration block below handles the v0.1 → v0.2 reshape.
     db.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
           session_id          TEXT PRIMARY KEY,
-          thread_root_id      TEXT NOT NULL UNIQUE,
+          thread_root_id      TEXT NOT NULL,
           room_id             TEXT NOT NULL,
           created_at          INTEGER NOT NULL,
           last_message_at     INTEGER NOT NULL,
@@ -113,13 +134,18 @@ def init_db(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_last_msg ON sessions(last_message_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_thread_root ON sessions(thread_root_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 
         -- Maps any manager-posted event_id (ack, response chunks) back to a
-        -- thread_root, so replies to those events resolve to the right session.
+        -- thread_root, so replies to those events resolve to the right active
+        -- session. v0.2: FK removed because thread_root_id is no longer UNIQUE
+        -- (multiple sessions per thread: at most one active + N retired).
         CREATE TABLE IF NOT EXISTS event_aliases (
           event_id       TEXT PRIMARY KEY,
-          thread_root_id TEXT NOT NULL REFERENCES sessions(thread_root_id) ON DELETE CASCADE
+          thread_root_id TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_event_aliases_thread_root
+          ON event_aliases(thread_root_id);
 
         CREATE TABLE IF NOT EXISTS poll_state (
           id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -127,6 +153,40 @@ def init_db(db: sqlite3.Connection) -> None:
           updated_at INTEGER NOT NULL
         );
     """)
+
+    # v0.1 → v0.2 migration: drop UNIQUE on sessions.thread_root_id and the
+    # event_aliases FK that depended on it. Recreates both tables in place.
+    if _sessions_has_unique_thread_root(db):
+        log.info("action=schema_migration from=v0.1 to=v0.2")
+        db.executescript("""
+            CREATE TABLE sessions_new (
+              session_id          TEXT PRIMARY KEY,
+              thread_root_id      TEXT NOT NULL,
+              room_id             TEXT NOT NULL,
+              created_at          INTEGER NOT NULL,
+              last_message_at     INTEGER NOT NULL,
+              token_fill_pct      REAL DEFAULT 0.0,
+              status              TEXT DEFAULT 'active',
+              previous_session_id TEXT,
+              handoff_injected    INTEGER DEFAULT 0
+            );
+            INSERT INTO sessions_new SELECT * FROM sessions;
+            DROP TABLE sessions;
+            ALTER TABLE sessions_new RENAME TO sessions;
+            CREATE INDEX idx_sessions_last_msg ON sessions(last_message_at);
+            CREATE INDEX idx_sessions_thread_root ON sessions(thread_root_id);
+            CREATE INDEX idx_sessions_status ON sessions(status);
+
+            CREATE TABLE event_aliases_new (
+              event_id       TEXT PRIMARY KEY,
+              thread_root_id TEXT NOT NULL
+            );
+            INSERT INTO event_aliases_new SELECT event_id, thread_root_id FROM event_aliases;
+            DROP TABLE event_aliases;
+            ALTER TABLE event_aliases_new RENAME TO event_aliases;
+            CREATE INDEX idx_event_aliases_thread_root ON event_aliases(thread_root_id);
+        """)
+
     db.commit()
 
 
@@ -168,9 +228,11 @@ def touch_session(db: sqlite3.Connection, session_id: str) -> None:
 
 
 def get_session_by_event(db: sqlite3.Connection, event_id: str) -> sqlite3.Row | None:
-    """Resolve any event_id (thread root, ack, or response chunk) to a session row."""
+    """Resolve any event_id (thread root, ack, or response chunk) to the active
+    session for that thread. Retired rows are ignored."""
     row = db.execute(
-        "SELECT * FROM sessions WHERE thread_root_id = ?", (event_id,)
+        "SELECT * FROM sessions WHERE thread_root_id = ? AND status = 'active'",
+        (event_id,),
     ).fetchone()
     if row:
         return row
@@ -179,7 +241,8 @@ def get_session_by_event(db: sqlite3.Connection, event_id: str) -> sqlite3.Row |
     ).fetchone()
     if alias:
         return db.execute(
-            "SELECT * FROM sessions WHERE thread_root_id = ?",
+            "SELECT * FROM sessions "
+            "WHERE thread_root_id = ? AND status = 'active'",
             (alias["thread_root_id"],),
         ).fetchone()
     return None
@@ -203,8 +266,17 @@ def cleanup_old_sessions(db: sqlite3.Connection, retention_days: int) -> None:
         deleted = db.execute(
             "DELETE FROM sessions WHERE last_message_at < ?", (cutoff,)
         ).rowcount
-    if deleted:
-        log.info("action=session_cleanup deleted=%d retention_days=%d", deleted, retention_days)
+        # Orphan aliases: with FK gone, prune aliases whose thread_root_id
+        # has no surviving session row.
+        orphans = db.execute(
+            "DELETE FROM event_aliases WHERE thread_root_id NOT IN "
+            "(SELECT thread_root_id FROM sessions)"
+        ).rowcount
+    if deleted or orphans:
+        log.info(
+            "action=session_cleanup deleted=%d alias_orphans=%d retention_days=%d",
+            deleted, orphans, retention_days,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +448,163 @@ async def resume_personal(
 
 
 # ---------------------------------------------------------------------------
+# v0.2 — transcript reader + rollover
+# ---------------------------------------------------------------------------
+
+def transcripts_dir(project_dir: str) -> Path:
+    """Map a project_dir to its Claude Code transcript directory.
+    Path is encoded by replacing every non-alphanumeric / non-hyphen char with
+    a hyphen — the same encoding Claude Code itself uses."""
+    encoded = re.sub(r"[^a-zA-Z0-9-]", "-", project_dir)
+    return Path.home() / ".claude" / "projects" / encoded
+
+
+def read_last_n_turns(session_id: str, project_dir: str, n: int = 10) -> str:
+    """Return last N user/assistant turns from a session's JSONL transcript
+    as plain text, or empty string if the transcript is missing or unparsable."""
+    transcript = transcripts_dir(project_dir) / f"{session_id}.jsonl"
+    if not transcript.exists():
+        return ""
+    turns: list[str] = []
+    try:
+        for line in transcript.read_text(errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg_type = entry.get("type")
+            message = entry.get("message") or {}
+            content = message.get("content")
+            if msg_type == "user" and isinstance(content, str):
+                turns.append(f"[user] {content}")
+            elif msg_type == "assistant" and isinstance(content, list):
+                texts = [
+                    c.get("text", "")
+                    for c in content
+                    if isinstance(c, dict) and c.get("type") == "text"
+                ]
+                joined = " ".join(t for t in texts if t).strip()
+                if joined:
+                    turns.append(f"[assistant] {joined}")
+    except OSError as exc:
+        log.warning("action=transcript_read_error session=%s err=%s",
+                    session_id[:8], exc)
+        return ""
+    return "\n\n".join(turns[-n:])
+
+
+HANDOFF_PROMPT = (
+    "Summarize this conversation as a handoff to your future self. "
+    "Include: open threads, user state, decisions made, next steps. "
+    "Prioritize fast-changing state (open tasks, pending delegations, "
+    "unresolved questions, recent decisions) over stable facts — stable "
+    "facts are already in memsearch and don't need regenerating. "
+    "Be specific. ~400 words. Plain text only."
+)
+
+
+async def trigger_rollover(
+    db: sqlite3.Connection,
+    session_id: str,
+    thread_root_id: str,
+    room_id: str,
+    project_dir: str,
+    subprocess_timeout: int,
+) -> str | None:
+    """Generate handoff, retire old session, allocate new session_id (do NOT
+    spawn). Returns new_session_id on success, None on failure (old session
+    stays active so the next user message resumes normally)."""
+    short_id = session_id[:8]
+    log.info("action=rollover_start session_id=%s trigger=idle", short_id)
+    try:
+        rc, handoff_text = await resume_personal(
+            session_id, HANDOFF_PROMPT, project_dir, subprocess_timeout,
+        )
+    except asyncio.TimeoutError:
+        log.error("action=rollover_handoff_timeout session_id=%s", short_id)
+        return None
+    if rc != 0:
+        log.error("action=rollover_handoff_error session_id=%s rc=%d",
+                  short_id, rc)
+        return None
+
+    last_10 = read_last_n_turns(session_id, project_dir, n=10)
+
+    HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
+    handoff_path = HANDOFFS_DIR / f"{session_id}.md"
+    body = (
+        f"# Handoff from session {short_id}\n\n"
+        f"{handoff_text}\n\n"
+        f"## Last 10 messages\n\n{last_10}\n"
+    )
+    handoff_path.write_text(body)
+    os.chmod(handoff_path, 0o600)
+
+    new_id = str(uuid.uuid4())
+    now_ts = int(time.time())
+    with db:
+        db.execute(
+            "UPDATE sessions SET status='retired' WHERE session_id=?",
+            (session_id,),
+        )
+        db.execute(
+            """INSERT INTO sessions
+                 (session_id, thread_root_id, room_id, created_at,
+                  last_message_at, status, previous_session_id, handoff_injected)
+               VALUES (?, ?, ?, ?, ?, 'active', ?, 0)""",
+            (new_id, thread_root_id, room_id, now_ts, now_ts, session_id),
+        )
+    log.info(
+        "action=rollover_complete old=%s new=%s handoff_bytes=%d",
+        short_id, new_id[:8], len(body),
+    )
+    return new_id
+
+
+async def idle_monitor(
+    db: sqlite3.Connection,
+    config: dict,
+) -> None:
+    """Background task — every idle_check_interval_seconds, scan active sessions
+    for ones idle past idle_threshold_seconds and roll each over sequentially."""
+    interval = int(config.get("idle_check_interval_seconds", 60))
+    threshold = int(config.get("idle_threshold_seconds", 1800))
+    project_dir = config["project_dir"]
+    subprocess_timeout = int(config.get(
+        "subprocess_timeout_seconds", DEFAULT_SUBPROCESS_TIMEOUT
+    ))
+    log.info(
+        "action=idle_monitor_start interval_s=%d threshold_s=%d",
+        interval, threshold,
+    )
+    while True:
+        try:
+            cutoff = int(time.time()) - threshold
+            rows = db.execute(
+                "SELECT session_id, thread_root_id, room_id "
+                "FROM sessions WHERE status='active' AND last_message_at < ? "
+                "ORDER BY last_message_at ASC",
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                await trigger_rollover(
+                    db,
+                    session_id=row["session_id"],
+                    thread_root_id=row["thread_root_id"],
+                    room_id=row["room_id"],
+                    project_dir=project_dir,
+                    subprocess_timeout=subprocess_timeout,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("action=idle_monitor_error")
+        await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
 # Thread / reply resolution
 # ---------------------------------------------------------------------------
 
@@ -520,11 +749,49 @@ async def handle_event(
                     return
                 _last_resume_at = now
                 start = time.time()
+                # First message after rollover: spawn the new session_id with
+                # handoff text + last-10 turns prepended. handoff_injected is
+                # set to 1 even on subprocess error so we don't re-prepend
+                # context on a retry — claude --session-id is idempotent.
+                needs_handoff = (
+                    not row["handoff_injected"]
+                    and row["previous_session_id"]
+                )
                 try:
-                    rc, output = await resume_personal(
-                        session_id, stamp(user_message), project_dir,
-                        subprocess_timeout,
-                    )
+                    if needs_handoff:
+                        prev_id = row["previous_session_id"]
+                        handoff_path = HANDOFFS_DIR / f"{prev_id}.md"
+                        handoff_text = (
+                            handoff_path.read_text(errors="replace")
+                            if handoff_path.exists() else ""
+                        )
+                        full_message = (
+                            "[Session context — recent conversation summary "
+                            "and last messages:\n"
+                            f"{handoff_text}\n"
+                            "---]\n\n"
+                            f"{stamp(user_message)}"
+                        )
+                        log.info(
+                            "action=continuity_inject session_id=%s prev=%s "
+                            "handoff_bytes=%d",
+                            short_id, prev_id[:8], len(handoff_text),
+                        )
+                        rc, output = await spawn_personal(
+                            session_id, full_message, project_dir,
+                            subprocess_timeout,
+                        )
+                        with db:
+                            db.execute(
+                                "UPDATE sessions SET handoff_injected=1 "
+                                "WHERE session_id=?",
+                                (session_id,),
+                            )
+                    else:
+                        rc, output = await resume_personal(
+                            session_id, stamp(user_message), project_dir,
+                            subprocess_timeout,
+                        )
                 except asyncio.TimeoutError:
                     log.error("action=resume_timeout session_id=%s", short_id)
                     timeout_event_id = await post_message(
@@ -735,14 +1002,20 @@ async def main() -> None:
         try:
             await post_message(
                 client, room_id,
-                "personal-agent v0.1 online.",
+                "personal-agent v0.2 online.",
             )
         except Exception:
             log.exception("action=startup_notify_error")
 
+    idle_task = asyncio.create_task(idle_monitor(db, config))
     try:
         await poll_loop(client, config, db, operator_user_id, room_id)
     finally:
+        idle_task.cancel()
+        try:
+            await idle_task
+        except (asyncio.CancelledError, Exception):
+            pass
         for proc_key, proc in list(_active_processes.items()):
             try:
                 proc.send_signal(signal.SIGTERM)

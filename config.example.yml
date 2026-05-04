@@ -22,5 +22,12 @@ subprocess_timeout_seconds: 1800
 # Retention for session metadata in SQLite (days).
 session_retention_days: 30
 
+# v0.2 — idle-based session rollover.
+# When an active session has not received a message for idle_threshold_seconds,
+# the idle monitor generates a handoff summary, retires the session, and
+# allocates a new session_id. Continuity is injected on the next user message.
+idle_threshold_seconds: 1800
+idle_check_interval_seconds: 60
+
 # Optional: post a startup notification to the room when the manager comes up.
 startup_notify: true
