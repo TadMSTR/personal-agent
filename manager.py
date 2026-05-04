@@ -1199,7 +1199,7 @@ async def main() -> None:
         try:
             await post_message(
                 client, room_id,
-                "personal-agent v0.2 online.",
+                "personal-agent v0.3 online.",
             )
         except Exception:
             log.exception("action=startup_notify_error")
