@@ -36,6 +36,20 @@
 - L3: Full stderr routed to `log.error`; Matrix gets sanitized error message
 - L4: Messages >32,000 chars rejected before subprocess invocation
 
+### Security (v0.2 audit — commit `26c561c`)
+- M1: `trigger_rollover()` rechecks session freshness under `_room_lock` before
+  generating handoff — prevents wasted handoff on a freshly-active session
+- M2: `handle_event()` re-fetches session row inside `_room_lock` — prevents
+  resuming a retired session when idle monitor races the handler
+- L1: `handoff_injected` set before `spawn_personal()` so `TimeoutError`
+  does not cause double-injection on retry
+- L2: Handoff `.tmp` file created with mode `0o600` via `os.open()` — eliminates
+  brief permissions window from the prior `write_text()+chmod()` sequence
+- L3: `read_last_n_turns()` capped to 32KB; `handoff_text` capped to 16KB in
+  continuity injection — prevents `ARG_MAX` overflow
+- L4: `trigger_rollover()` uses `HANDOFF_TIMEOUT_SECONDS=300` instead of full
+  `subprocess_timeout` — bounds room lock duration to 5 min for handoff generation
+
 ## [0.1.0] — 2026-05-03
 
 ### Added
