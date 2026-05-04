@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.3.0] — 2026-05-04
+
+### Added
+- Three OR'd rollover triggers replacing the fixed 1800s idle threshold (commit `e0d2018`):
+  - `token_budget`: rollover at fill ≥ 80%
+  - `age_cap`: rollover at age > 24h
+  - `idle`: dynamic threshold (360s/1200s/1800s at fill ≥80% / ≥60% / else)
+- `get_token_fill_pct()`: estimates context fill from JSONL transcript
+- `idle_threshold_for_fill()`: maps fill to idle window
+- `should_rollover()`: per-session trigger evaluation, returns `(do_rollover, trigger, threshold)`
+- `update_token_fill()`: updates `sessions.token_fill_pct` after each claude exit
+- `context_window_tokens` config key (default 200000) — denominator for fill_pct
+- 5% minimum-fill floor on idle trigger to avoid wasted handoff on near-empty sessions (commit `d5e669c`)
+
+### Changed
+- `idle_monitor()` now evaluates `should_rollover()` per active session instead of a fixed cutoff
+- `trigger_rollover()` accepts `trigger` and `threshold` arguments; recheck branches on trigger type
+- Startup notification bumped to `personal-agent v0.3 online.` (commit `a625827`)
+
+### Security (v0.3 audit — commit `ae9276b`)
+- M1: `get_token_fill_pct()` rewritten to reverse-scan transcript and sum
+  `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` from the
+  latest entry with usage. Original implementation summed `input_tokens` only,
+  undercounting by ~95% under prompt caching and silently no-op'ing the
+  `token_budget` trigger.
+- M2: `trigger_rollover()` recheck branches on trigger type — `idle` validates
+  freshness, `token_budget` re-reads fill, `age_cap` re-checks age. The v0.2
+  recheck always tested idleness, silently dropping `token_budget` and
+  `age_cap` rollovers when the user was active.
+- L1: subsumed by M1's reverse-scan-and-break — full transcript no longer
+  read inside `_room_lock`.
+- L2: `200_000` divisor lifted to `context_window_tokens` config key
+  (default 200000), threaded through `idle_monitor` and `handle_event`.
+
 ## [0.2.0] — 2026-05-04
 
 ### Added
