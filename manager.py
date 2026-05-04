@@ -467,9 +467,12 @@ def transcripts_dir(project_dir: str) -> Path:
     return Path.home() / ".claude" / "projects" / encoded
 
 
-def read_last_n_turns(session_id: str, project_dir: str, n: int = 10) -> str:
+def read_last_n_turns(
+    session_id: str, project_dir: str, n: int = 10, max_bytes: int = 32_000
+) -> str:
     """Return last N user/assistant turns from a session's JSONL transcript
-    as plain text, or empty string if the transcript is missing or unparsable."""
+    as plain text, or empty string if the transcript is missing or unparsable.
+    Truncates to max_bytes to prevent ARG_MAX overflow in continuity injection."""
     transcript = transcripts_dir(project_dir) / f"{session_id}.jsonl"
     if not transcript.exists():
         return ""
@@ -500,8 +503,13 @@ def read_last_n_turns(session_id: str, project_dir: str, n: int = 10) -> str:
         log.warning("action=transcript_read_error session=%s err=%s",
                     session_id[:8], exc)
         return ""
-    return "\n\n".join(turns[-n:])
+    result = "\n\n".join(turns[-n:])
+    if len(result.encode()) > max_bytes:
+        result = "[…truncated…]\n\n" + result[-max_bytes:]
+    return result
 
+
+HANDOFF_TIMEOUT_SECONDS = 300  # 5 min ceiling for ~400-word summary
 
 HANDOFF_PROMPT = (
     "Summarize this conversation as a handoff to your future self. "
@@ -520,6 +528,7 @@ async def trigger_rollover(
     room_id: str,
     project_dir: str,
     subprocess_timeout: int,
+    threshold: int,
 ) -> str | None:
     """Generate handoff, retire old session, allocate new session_id (do NOT
     spawn). Returns new_session_id on success, None on failure (old session
@@ -532,9 +541,20 @@ async def trigger_rollover(
     short_id = session_id[:8]
     log.info("action=rollover_start session_id=%s trigger=idle", short_id)
     async with _room_lock:
+        # M1: recheck freshness under lock — a user message may have arrived
+        # and updated last_message_at between snapshot and lock-acquire.
+        fresh = db.execute(
+            "SELECT last_message_at, status FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if (not fresh or fresh["status"] != "active"
+                or fresh["last_message_at"] >= int(time.time()) - threshold):
+            log.info("action=rollover_skip_stale session_id=%s", short_id)
+            return None
+
         try:
             rc, handoff_text = await resume_personal(
-                session_id, HANDOFF_PROMPT, project_dir, subprocess_timeout,
+                session_id, HANDOFF_PROMPT, project_dir, HANDOFF_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
             log.error("action=rollover_handoff_timeout session_id=%s", short_id)
@@ -548,17 +568,18 @@ async def trigger_rollover(
 
         HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
         handoff_path = HANDOFFS_DIR / f"{session_id}.md"
-        # Atomic write: stage to .tmp, chmod, then rename. Guarantees readers
-        # see either the prior content (if any) or the complete new content,
-        # never a partially-written file.
+        # Atomic write: stage to .tmp with mode 0o600 from creation (no
+        # permissions window), then rename. Guarantees readers see either the
+        # prior content or the complete new content, never a partial file.
         tmp_path = handoff_path.with_suffix(".md.tmp")
         body = (
             f"# Handoff from session {short_id}\n\n"
             f"{handoff_text}\n\n"
             f"## Last 10 messages\n\n{last_10}\n"
         )
-        tmp_path.write_text(body)
-        os.chmod(tmp_path, 0o600)
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
         tmp_path.replace(handoff_path)
 
         new_id = str(uuid.uuid4())
@@ -616,6 +637,7 @@ async def idle_monitor(
                     room_id=row["room_id"],
                     project_dir=project_dir,
                     subprocess_timeout=subprocess_timeout,
+                    threshold=threshold,
                 )
         except asyncio.CancelledError:
             raise
@@ -752,6 +774,21 @@ async def handle_event(
             )
             register_alias(db, ack_event_id, thread_root_id)
             async with _room_lock:
+                # M2: re-fetch session row under lock — idle_monitor may have
+                # rolled over this session between get_session_by_event() and
+                # lock-acquire. Use fresh data for all subsequent logic.
+                fresh = get_session_by_event(db, thread_root)
+                if fresh is None or fresh["session_id"] != row["session_id"]:
+                    row = fresh
+                    if row is None:
+                        log.info(
+                            "action=session_rolled_over_during_handler "
+                            "thread=%s", thread_root[:8],
+                        )
+                        return
+                    session_id = row["session_id"]
+                    thread_root_id = row["thread_root_id"]
+                    short_id = session_id[:8]
                 global _last_resume_at
                 now = time.time()
                 if now - _last_resume_at < RESUME_RATE_LIMIT_SECONDS:
@@ -769,10 +806,6 @@ async def handle_event(
                     return
                 _last_resume_at = now
                 start = time.time()
-                # First message after rollover: spawn the new session_id with
-                # handoff text + last-10 turns prepended. handoff_injected is
-                # set to 1 even on subprocess error so we don't re-prepend
-                # context on a retry — claude --session-id is idempotent.
                 needs_handoff = (
                     not row["handoff_injected"]
                     and row["previous_session_id"]
@@ -785,6 +818,11 @@ async def handle_event(
                             handoff_path.read_text(errors="replace")
                             if handoff_path.exists() else ""
                         )
+                        # L3: cap handoff_text to prevent oversized CLI args
+                        if len(handoff_text.encode()) > 16_000:
+                            handoff_text = (
+                                handoff_text[:16_000] + "\n[…handoff truncated…]"
+                            )
                         full_message = (
                             "[Session context — recent conversation summary "
                             "and last messages:\n"
@@ -797,16 +835,18 @@ async def handle_event(
                             "handoff_bytes=%d",
                             short_id, prev_id[:8], len(handoff_text),
                         )
-                        rc, output = await spawn_personal(
-                            session_id, full_message, project_dir,
-                            subprocess_timeout,
-                        )
+                        # L1: set handoff_injected before spawn so a
+                        # TimeoutError doesn't cause double-injection on retry
                         with db:
                             db.execute(
                                 "UPDATE sessions SET handoff_injected=1 "
                                 "WHERE session_id=?",
                                 (session_id,),
                             )
+                        rc, output = await spawn_personal(
+                            session_id, full_message, project_dir,
+                            subprocess_timeout,
+                        )
                     else:
                         rc, output = await resume_personal(
                             session_id, stamp(user_message), project_dir,
