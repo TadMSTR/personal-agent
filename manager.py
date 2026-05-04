@@ -563,7 +563,9 @@ def should_rollover(row: sqlite3.Row, now: float) -> tuple[bool, str, int]:
         return True, "token_budget", threshold
     if age_secs > 86400:
         return True, "age_cap", threshold
-    if idle_secs > threshold:
+    # Idle trigger only fires if the session has meaningful content (~10k tokens).
+    # Prevents burning a handoff call on a nearly-empty session.
+    if idle_secs > threshold and fill >= 0.05:
         return True, "idle", threshold
     return False, "", threshold
 
