@@ -156,9 +156,16 @@ def init_db(db: sqlite3.Connection) -> None:
 
     # v0.1 → v0.2 migration: drop UNIQUE on sessions.thread_root_id and the
     # event_aliases FK that depended on it. Recreates both tables in place.
+    # Wrapped in explicit BEGIN/COMMIT so a process kill during migration
+    # rolls back to the v0.1 schema rather than leaving sessions dropped
+    # before the rename completes.
     if _sessions_has_unique_thread_root(db):
         log.info("action=schema_migration from=v0.1 to=v0.2")
         db.executescript("""
+            BEGIN;
+            DROP TABLE IF EXISTS sessions_new;
+            DROP TABLE IF EXISTS event_aliases_new;
+
             CREATE TABLE sessions_new (
               session_id          TEXT PRIMARY KEY,
               thread_root_id      TEXT NOT NULL,
@@ -185,6 +192,7 @@ def init_db(db: sqlite3.Connection) -> None:
             DROP TABLE event_aliases;
             ALTER TABLE event_aliases_new RENAME TO event_aliases;
             CREATE INDEX idx_event_aliases_thread_root ON event_aliases(thread_root_id);
+            COMMIT;
         """)
 
     db.commit()
@@ -515,47 +523,59 @@ async def trigger_rollover(
 ) -> str | None:
     """Generate handoff, retire old session, allocate new session_id (do NOT
     spawn). Returns new_session_id on success, None on failure (old session
-    stays active so the next user message resumes normally)."""
+    stays active so the next user message resumes normally).
+
+    Acquires _room_lock for the duration of the resume_personal call so a
+    concurrent user message handler can't run a second `claude -p --resume`
+    against the same session_id and corrupt the shared JSONL transcript."""
+    assert _room_lock is not None
     short_id = session_id[:8]
     log.info("action=rollover_start session_id=%s trigger=idle", short_id)
-    try:
-        rc, handoff_text = await resume_personal(
-            session_id, HANDOFF_PROMPT, project_dir, subprocess_timeout,
-        )
-    except asyncio.TimeoutError:
-        log.error("action=rollover_handoff_timeout session_id=%s", short_id)
-        return None
-    if rc != 0:
-        log.error("action=rollover_handoff_error session_id=%s rc=%d",
-                  short_id, rc)
-        return None
+    async with _room_lock:
+        try:
+            rc, handoff_text = await resume_personal(
+                session_id, HANDOFF_PROMPT, project_dir, subprocess_timeout,
+            )
+        except asyncio.TimeoutError:
+            log.error("action=rollover_handoff_timeout session_id=%s", short_id)
+            return None
+        if rc != 0:
+            log.error("action=rollover_handoff_error session_id=%s rc=%d",
+                      short_id, rc)
+            return None
 
-    last_10 = read_last_n_turns(session_id, project_dir, n=10)
+        last_10 = read_last_n_turns(session_id, project_dir, n=10)
 
-    HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
-    handoff_path = HANDOFFS_DIR / f"{session_id}.md"
-    body = (
-        f"# Handoff from session {short_id}\n\n"
-        f"{handoff_text}\n\n"
-        f"## Last 10 messages\n\n{last_10}\n"
-    )
-    handoff_path.write_text(body)
-    os.chmod(handoff_path, 0o600)
+        HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
+        handoff_path = HANDOFFS_DIR / f"{session_id}.md"
+        # Atomic write: stage to .tmp, chmod, then rename. Guarantees readers
+        # see either the prior content (if any) or the complete new content,
+        # never a partially-written file.
+        tmp_path = handoff_path.with_suffix(".md.tmp")
+        body = (
+            f"# Handoff from session {short_id}\n\n"
+            f"{handoff_text}\n\n"
+            f"## Last 10 messages\n\n{last_10}\n"
+        )
+        tmp_path.write_text(body)
+        os.chmod(tmp_path, 0o600)
+        tmp_path.replace(handoff_path)
 
-    new_id = str(uuid.uuid4())
-    now_ts = int(time.time())
-    with db:
-        db.execute(
-            "UPDATE sessions SET status='retired' WHERE session_id=?",
-            (session_id,),
-        )
-        db.execute(
-            """INSERT INTO sessions
-                 (session_id, thread_root_id, room_id, created_at,
-                  last_message_at, status, previous_session_id, handoff_injected)
-               VALUES (?, ?, ?, ?, ?, 'active', ?, 0)""",
-            (new_id, thread_root_id, room_id, now_ts, now_ts, session_id),
-        )
+        new_id = str(uuid.uuid4())
+        now_ts = int(time.time())
+        with db:
+            db.execute(
+                "UPDATE sessions SET status='retired' WHERE session_id=?",
+                (session_id,),
+            )
+            db.execute(
+                """INSERT INTO sessions
+                     (session_id, thread_root_id, room_id, created_at,
+                      last_message_at, status, previous_session_id,
+                      handoff_injected)
+                   VALUES (?, ?, ?, ?, ?, 'active', ?, 0)""",
+                (new_id, thread_root_id, room_id, now_ts, now_ts, session_id),
+            )
     log.info(
         "action=rollover_complete old=%s new=%s handoff_bytes=%d",
         short_id, new_id[:8], len(body),
