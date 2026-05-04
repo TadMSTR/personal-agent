@@ -18,8 +18,14 @@ v0.2 scope (added):
   - Multiple sessions per Matrix thread (status='active' filter); thread_root_id
     no longer UNIQUE in sessions; event_aliases FK dropped (FK requires UNIQUE).
 
+v0.3 scope (added):
+  - Three OR'd rollover triggers: dynamic idle threshold (scales with token fill),
+    direct token-budget trigger at >=80% fill, 24-hour age cap.
+  - token_fill_pct updated in sessions table after each claude response.
+  - idle_monitor now calls should_rollover() per session instead of a fixed cutoff.
+
 Future phases extend this file:
-  v0.3 — token-fill / age triggers
+  v0.4 — typing indicators + cold-start memsearch injection
   v0.4 — typing indicators + cold-start memsearch injection
   v0.5 — task-queue delegation + agent-bus event subscription
   v0.6 — Gitea-backed self-modification with locked-section validation
@@ -509,6 +515,75 @@ def read_last_n_turns(
     return result
 
 
+def get_token_fill_pct(session_id: str, project_dir: str) -> float:
+    """Estimate context fill from cumulative input tokens in JSONL transcript.
+    Sonnet context window: 200k tokens. Returns 0.0–1.0."""
+    transcript = transcripts_dir(project_dir) / f"{session_id}.jsonl"
+    if not transcript.exists():
+        return 0.0
+    total_input = 0
+    try:
+        for line in transcript.read_text(errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            usage = (obj.get("message") or {}).get("usage") or {}
+            total_input += usage.get("input_tokens", 0)
+    except OSError:
+        return 0.0
+    return min(total_input / 200_000, 1.0)
+
+
+def idle_threshold_for_fill(token_fill_pct: float) -> int:
+    """Dynamic idle threshold — shorter window as context fills up."""
+    if token_fill_pct >= 0.80:
+        return 360    # 6 min — near-full, roll over quickly
+    if token_fill_pct >= 0.60:
+        return 1200   # 20 min
+    return 1800       # 30 min default
+
+
+def should_rollover(row: sqlite3.Row, now: float) -> tuple[bool, str, int]:
+    """Return (should_rollover, trigger_name, idle_threshold_used).
+
+    Three OR'd triggers:
+      token_budget — fill >= 80% regardless of idle time
+      age_cap      — session older than 24 hours
+      idle         — idle time exceeds dynamic threshold based on fill
+    """
+    fill = row["token_fill_pct"] or 0.0
+    threshold = idle_threshold_for_fill(fill)
+    idle_secs = now - row["last_message_at"]
+    age_secs = now - row["created_at"]
+
+    if fill >= 0.80:
+        return True, "token_budget", threshold
+    if age_secs > 86400:
+        return True, "age_cap", threshold
+    if idle_secs > threshold:
+        return True, "idle", threshold
+    return False, "", threshold
+
+
+def update_token_fill(
+    db: sqlite3.Connection, session_id: str, project_dir: str
+) -> float:
+    """Read transcript, update token_fill_pct in sessions table, return new value."""
+    fill = get_token_fill_pct(session_id, project_dir)
+    with db:
+        db.execute(
+            "UPDATE sessions SET token_fill_pct=? WHERE session_id=?",
+            (fill, session_id),
+        )
+    if fill >= 0.70:
+        log.info("action=token_fill_updated session_id=%s fill_pct=%.3f",
+                 session_id[:8], fill)
+    return fill
+
+
 HANDOFF_TIMEOUT_SECONDS = 300  # 5 min ceiling for ~400-word summary
 
 HANDOFF_PROMPT = (
@@ -529,6 +604,7 @@ async def trigger_rollover(
     project_dir: str,
     subprocess_timeout: int,
     threshold: int,
+    trigger: str = "idle",
 ) -> str | None:
     """Generate handoff, retire old session, allocate new session_id (do NOT
     spawn). Returns new_session_id on success, None on failure (old session
@@ -539,7 +615,7 @@ async def trigger_rollover(
     against the same session_id and corrupt the shared JSONL transcript."""
     assert _room_lock is not None
     short_id = session_id[:8]
-    log.info("action=rollover_start session_id=%s trigger=idle", short_id)
+    log.info("action=rollover_start session_id=%s trigger=%s", short_id, trigger)
     async with _room_lock:
         # M1: recheck freshness under lock — a user message may have arrived
         # and updated last_message_at between snapshot and lock-acquire.
@@ -608,37 +684,37 @@ async def idle_monitor(
     db: sqlite3.Connection,
     config: dict,
 ) -> None:
-    """Background task — every idle_check_interval_seconds, scan active sessions
-    for ones idle past idle_threshold_seconds and roll each over sequentially."""
+    """Background task — every idle_check_interval_seconds, evaluate all active
+    sessions against three OR'd triggers (token_budget, age_cap, idle) and roll
+    over any that qualify."""
     interval = int(config.get("idle_check_interval_seconds", 60))
-    threshold = int(config.get("idle_threshold_seconds", 1800))
     project_dir = config["project_dir"]
     subprocess_timeout = int(config.get(
         "subprocess_timeout_seconds", DEFAULT_SUBPROCESS_TIMEOUT
     ))
-    log.info(
-        "action=idle_monitor_start interval_s=%d threshold_s=%d",
-        interval, threshold,
-    )
+    log.info("action=idle_monitor_start interval_s=%d mode=dynamic_triggers", interval)
     while True:
         try:
-            cutoff = int(time.time()) - threshold
+            now = time.time()
             rows = db.execute(
-                "SELECT session_id, thread_root_id, room_id "
-                "FROM sessions WHERE status='active' AND last_message_at < ? "
+                "SELECT session_id, thread_root_id, room_id, "
+                "last_message_at, created_at, token_fill_pct "
+                "FROM sessions WHERE status='active' "
                 "ORDER BY last_message_at ASC",
-                (cutoff,),
             ).fetchall()
             for row in rows:
-                await trigger_rollover(
-                    db,
-                    session_id=row["session_id"],
-                    thread_root_id=row["thread_root_id"],
-                    room_id=row["room_id"],
-                    project_dir=project_dir,
-                    subprocess_timeout=subprocess_timeout,
-                    threshold=threshold,
-                )
+                do_rollover, trigger, threshold = should_rollover(row, now)
+                if do_rollover:
+                    await trigger_rollover(
+                        db,
+                        session_id=row["session_id"],
+                        thread_root_id=row["thread_root_id"],
+                        room_id=row["room_id"],
+                        project_dir=project_dir,
+                        subprocess_timeout=subprocess_timeout,
+                        threshold=threshold,
+                        trigger=trigger,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -863,6 +939,7 @@ async def handle_event(
                     register_alias(db, timeout_event_id, thread_root_id)
                     return
                 touch_session(db, session_id)
+                update_token_fill(db, session_id, project_dir)
                 log.info(
                     "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
                     short_id, rc, time.time() - start,
@@ -925,6 +1002,7 @@ async def handle_event(
             )
             register_alias(db, timeout_event_id, event.event_id)
             return
+        update_token_fill(db, session_id, project_dir)
         log.info(
             "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
             short_id, rc, time.time() - start,
