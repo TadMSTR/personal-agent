@@ -784,6 +784,35 @@ async def trigger_rollover(
                 )
                 return None
 
+        # Orphan-session guard: a session created by a prior rollover that
+        # never received a user message has no JSONL transcript. `claude -p
+        # --resume` fails fast with "No conversation found", trigger_rollover
+        # aborts before retiring, and idle_monitor loops forever. Detect this
+        # case and retire-without-handoff: the new session starts cold with
+        # handoff_injected=1 so the next user message resumes normally.
+        transcript = transcripts_dir(project_dir) / f"{session_id}.jsonl"
+        if not transcript.exists():
+            new_id = str(uuid.uuid4())
+            now_ts = int(time.time())
+            with db:
+                db.execute(
+                    "UPDATE sessions SET status='retired' WHERE session_id=?",
+                    (session_id,),
+                )
+                db.execute(
+                    """INSERT INTO sessions
+                         (session_id, thread_root_id, room_id, created_at,
+                          last_message_at, status, previous_session_id,
+                          handoff_injected)
+                       VALUES (?, ?, ?, ?, ?, 'active', ?, 1)""",
+                    (new_id, thread_root_id, room_id, now_ts, now_ts, session_id),
+                )
+            log.info(
+                "action=rollover_no_transcript old=%s new=%s",
+                short_id, new_id[:8],
+            )
+            return new_id
+
         try:
             rc, handoff_text = await resume_personal(
                 session_id, HANDOFF_PROMPT, project_dir, HANDOFF_TIMEOUT_SECONDS,
