@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1] — 2026-05-05
+
+### Fixed
+- Typing indicators were silently failing since v0.4 launch: `room_typing()` was called
+  with `typing=` (wrong kwarg) instead of `typing_state=` per matrix-nio API, causing
+  `TypeError` on every invocation (commit `7c00f33`).
+- Orphan sessions (rollover-created sessions with no JSONL transcript) caused a 60s
+  idle-monitor loop: `trigger_rollover()` attempted `claude --resume` which failed,
+  returned without retiring the session, and the loop retried forever. Fixed with a
+  retire-only guard: detect missing transcript, retire in-place, return `None`. The next
+  user message hits the spawn-new path correctly (commits `eaac961`, `f7db0af`).
+
 ## [0.4.0] — 2026-05-05
 
 ### Added
