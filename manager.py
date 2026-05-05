@@ -527,14 +527,14 @@ async def resume_personal(
 
 async def _typing_on(client: AsyncClient, room_id: str) -> None:
     try:
-        await client.room_typing(room_id, typing=True, timeout=30000)
+        await client.room_typing(room_id, typing_state=True, timeout=30000)
     except Exception as e:
         log.warning("action=typing_error phase=on error_type=%s", type(e).__name__)
 
 
 async def _typing_off(client: AsyncClient, room_id: str) -> None:
     try:
-        await client.room_typing(room_id, typing=False)
+        await client.room_typing(room_id, typing_state=False)
     except Exception as e:
         log.warning("action=typing_error phase=off error_type=%s", type(e).__name__)
 
