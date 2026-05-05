@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.4.0] — 2026-05-05
+
+### Added
+- Matrix typing indicators: `_typing_on()` / `_typing_off()` wrap every claude
+  invocation in `handle_event` (thread-reply, room-root resume, new-session
+  spawn). try/finally placement clears typing on timeout/error.
+- Cold-start memsearch injection (commit `d7a0ff6`): brand-new sessions query
+  `memsearch search` with the user's first message and prepend top results
+  (capped at 8KB) to the spawn message. Resumes are unchanged.
+- `query_memsearch()`: async subprocess to `memsearch`, returns top results
+  or empty string on failure.
+- `_sanitize_memsearch()`: strips lines containing `---]` so adversarial
+  memory cannot break out of the `[Relevant prior context: ...---]` block.
+- `get_latest_active_session()`: helper used by the room-root path to find the
+  most recent active session.
+
+### Changed
+- Room-root messages (commit `4c8434b`): non-thread-reply messages in
+  `#personal` now resume the latest active session if one exists; only spawn
+  a new session when no active session is present. Matches the v0.1 design
+  intent — previously every room-root message spawned a new session.
+- Idle floor raised from 5% to 40% (commit `f8797bf`): `IDLE_MIN_FILL = 0.40`
+  prevents thin / single-message sessions from rolling over via the idle
+  trigger; they retire on the nightly cutoff instead.
+- `age_cap` (rolling 24h) replaced by `nightly_cutoff` (commit `f8797bf`):
+  fixed wall-clock 4 AM local boundary aligned with operator wake cycle.
+  `nightly_rollover_hour` config key (default 4) controls the boundary.
+- Startup notification bumped to `personal-agent v0.4 online.`
+
+### Security (v0.4 audit — commit `99f731a`)
+- M1: `query_memsearch` rewritten as async (`asyncio.create_subprocess_exec`
+  + `await`); event loop no longer blocks for up to 15s while memsearch runs.
+- L1: `query_memsearch` passes `env=_minimal_env()` so `MATRIX_TOKEN` /
+  `CLAUDE_API_KEY` / other secrets do not leak into the memsearch subprocess.
+- L2: `_sanitize_memsearch()` drops lines containing `---]` (Option A).
+  Nonce-delimited block (Option B) deferred — sanitization is adequate for
+  single-operator deployment.
+- L3: byte-aware truncation in `query_memsearch` — encode → byte-slice →
+  decode with `errors="replace"`. Matches `read_last_n_turns` convention.
+- L4: `last_nightly_cutoff` uses `.astimezone()` to attach system tzinfo
+  before `.timestamp()` — DST-deterministic.
+
+### Deferred
+- Lift `query_memsearch` out of `_room_lock` (auditor's optional M1
+  recommendation): async fix resolves event-loop blocking; lock-hold is
+  single-operator-bounded and self-throttling. Revisit at v0.5 when
+  task-queue delegation may add concurrent claude invocations.
+
 ## [0.3.0] — 2026-05-04
 
 ### Added

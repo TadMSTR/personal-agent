@@ -24,7 +24,7 @@ generalises to Helm.
 | v0.1 | complete | Single-session per thread, persona, delegation tool surface |
 | v0.2 | complete | Idle-based session rollover with handoff injection |
 | v0.3 | complete | Dynamic rollover triggers (idle / token-fill / age) |
-| v0.4 | planned | Typing indicators, cold-start memory injection, persona refinement |
+| v0.4 | complete | Typing indicators, cold-start memory injection, persona refinement |
 | v0.5 | planned | task-queue-mcp delegation flow + agent-bus result synthesis |
 | v0.6 | planned | Gitea-backed self-modification with locked-section validation |
 | v0.7 | planned | Sleep-window pipeline + 5:30 AM morning briefing |
