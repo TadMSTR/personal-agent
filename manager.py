@@ -51,7 +51,6 @@ import os
 import re
 import signal
 import sqlite3
-import subprocess
 import sys
 import time
 import uuid
@@ -383,21 +382,56 @@ def stamp(message: str) -> str:
     return f"[{now.strftime('%A, %Y-%m-%d %H:%M %Z')}]\n\n{message}"
 
 
-def query_memsearch(query: str, max_results: int = 5) -> str:
-    """Shell out to memsearch and return result text, or empty string on failure."""
+async def query_memsearch(query: str, max_results: int = 5) -> str:
+    """Shell out to memsearch and return result text, or empty string on failure.
+
+    M1: async subprocess so the event loop is not blocked while memsearch runs.
+    L1: passes _minimal_env() so memsearch does not inherit MATRIX_TOKEN /
+        CLAUDE_API_KEY / other secrets from the manager process env.
+    L3: byte-aware truncation — encode → byte-slice → decode with errors=replace.
+    """
     try:
-        result = subprocess.run(
-            ["memsearch", "search", query[:200], f"--limit={max_results}"],
-            capture_output=True, text=True, timeout=15,
+        proc = await asyncio.create_subprocess_exec(
+            "memsearch", "search", query[:200], f"--limit={max_results}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_minimal_env(),
         )
-        text = result.stdout.strip() if result.returncode == 0 else ""
-        # Cap at ~2000 tokens (≈8000 chars) to avoid bloating the spawn message
-        if len(text.encode()) > 8_000:
-            text = text[:8_000] + "\n[…memsearch results truncated…]"
+        try:
+            stdout_b, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=15,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            try:
+                await proc.communicate()
+            except Exception:
+                pass
+            log.warning("action=memsearch_failed error_type=TimeoutError")
+            return ""
+        if proc.returncode != 0:
+            return ""
+        text = stdout_b.decode(errors="replace").strip()
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) > 8_000:
+            text = (
+                encoded[:8_000].decode("utf-8", errors="replace")
+                + "\n[…memsearch results truncated…]"
+            )
         return text
     except Exception as e:
         log.warning("action=memsearch_failed error_type=%s", type(e).__name__)
         return ""
+
+
+def _sanitize_memsearch(text: str) -> str:
+    """L2: drop any line containing the closing delimiter so adversarial
+    memory content cannot break out of the [Relevant prior context: ...---]
+    block. Cheap defense-in-depth; nonce-delimited block deferred."""
+    if not text:
+        return text
+    return "\n".join(line for line in text.splitlines() if "---]" not in line)
 
 
 # ---------------------------------------------------------------------------
@@ -615,8 +649,14 @@ DEFAULT_NIGHTLY_HOUR = 4
 
 def last_nightly_cutoff(now_ts: float, nightly_hour: int) -> float:
     """Most recent occurrence of `nightly_hour:00:00` in local time, as a
-    Unix timestamp. If `now` is before today's cutoff, returns yesterday's."""
-    now_local = datetime.fromtimestamp(now_ts)
+    Unix timestamp. If `now` is before today's cutoff, returns yesterday's.
+
+    L4: `.astimezone()` (no arg) attaches system local tzinfo so subsequent
+    `.timestamp()` is deterministic across DST transitions. Note: setting
+    `nightly_rollover_hour` to a non-existent local hour during a DST spring
+    forward (typically 2 in US zones) can still drift by an hour twice a year;
+    keep the default of 4 unless you have a specific need."""
+    now_local = datetime.fromtimestamp(now_ts).astimezone()
     today = now_local.replace(
         hour=nightly_hour, minute=0, second=0, microsecond=0,
     )
@@ -1236,7 +1276,7 @@ async def handle_event(
         register_alias(db, ack_event_id, event.event_id)
 
         # v0.4: cold-start memsearch — prepend relevant prior context to first message
-        relevant_memory = query_memsearch(user_message)
+        relevant_memory = _sanitize_memsearch(await query_memsearch(user_message))
         if relevant_memory:
             spawn_message = (
                 f"[Relevant prior context:\n{relevant_memory}\n---]\n\n"
@@ -1410,7 +1450,7 @@ async def main() -> None:
         try:
             await post_message(
                 client, room_id,
-                "personal-agent v0.3 online.",
+                "personal-agent v0.4 online.",
             )
         except Exception:
             log.exception("action=startup_notify_error")
