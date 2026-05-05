@@ -51,7 +51,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -566,26 +566,48 @@ def idle_threshold_for_fill(token_fill_pct: float) -> int:
     return 1800       # 30 min default
 
 
-def should_rollover(row: sqlite3.Row, now: float) -> tuple[bool, str, int]:
+IDLE_MIN_FILL = 0.40
+DEFAULT_NIGHTLY_HOUR = 4
+
+
+def last_nightly_cutoff(now_ts: float, nightly_hour: int) -> float:
+    """Most recent occurrence of `nightly_hour:00:00` in local time, as a
+    Unix timestamp. If `now` is before today's cutoff, returns yesterday's."""
+    now_local = datetime.fromtimestamp(now_ts)
+    today = now_local.replace(
+        hour=nightly_hour, minute=0, second=0, microsecond=0,
+    )
+    if now_local < today:
+        today -= timedelta(days=1)
+    return today.timestamp()
+
+
+def should_rollover(
+    row: sqlite3.Row,
+    now: float,
+    nightly_hour: int = DEFAULT_NIGHTLY_HOUR,
+) -> tuple[bool, str, int]:
     """Return (should_rollover, trigger_name, idle_threshold_used).
 
     Three OR'd triggers:
-      token_budget — fill >= 80% regardless of idle time
-      age_cap      — session older than 24 hours
-      idle         — idle time exceeds dynamic threshold based on fill
+      token_budget    — fill >= 80% regardless of idle time
+      nightly_cutoff  — session was created before the most recent local
+                        nightly_hour boundary (default 4 AM)
+      idle            — idle time exceeds dynamic threshold based on fill,
+                        and fill is high enough to warrant a handoff
     """
     fill = row["token_fill_pct"] or 0.0
     threshold = idle_threshold_for_fill(fill)
     idle_secs = now - row["last_message_at"]
-    age_secs = now - row["created_at"]
 
     if fill >= 0.80:
         return True, "token_budget", threshold
-    if age_secs > 86400:
-        return True, "age_cap", threshold
-    # Idle trigger only fires if the session has meaningful content (~10k tokens).
-    # Prevents burning a handoff call on a nearly-empty session.
-    if idle_secs > threshold and fill >= 0.05:
+    if row["created_at"] < last_nightly_cutoff(now, nightly_hour):
+        return True, "nightly_cutoff", threshold
+    # Idle floor: skip rollover for sessions that haven't accumulated meaningful
+    # context yet. Below the floor the session would generate a thin handoff
+    # for very little real content, and the nightly cutoff sweeps these anyway.
+    if idle_secs > threshold and fill >= IDLE_MIN_FILL:
         return True, "idle", threshold
     return False, "", threshold
 
@@ -631,6 +653,7 @@ async def trigger_rollover(
     threshold: int,
     trigger: str = "idle",
     context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
+    nightly_hour: int = DEFAULT_NIGHTLY_HOUR,
 ) -> str | None:
     """Generate handoff, retire old session, allocate new session_id (do NOT
     spawn). Returns new_session_id on success, None on failure (old session
@@ -670,10 +693,10 @@ async def trigger_rollover(
                     short_id, current_fill,
                 )
                 return None
-        elif trigger == "age_cap":
-            if now_int - fresh["created_at"] <= 86400:
+        elif trigger == "nightly_cutoff":
+            if fresh["created_at"] >= last_nightly_cutoff(now_int, nightly_hour):
                 log.info(
-                    "action=rollover_skip_stale session_id=%s reason=age_drop",
+                    "action=rollover_skip_stale session_id=%s reason=post_cutoff",
                     short_id,
                 )
                 return None
@@ -745,7 +768,13 @@ async def idle_monitor(
     context_window = int(config.get(
         "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS
     ))
-    log.info("action=idle_monitor_start interval_s=%d mode=dynamic_triggers", interval)
+    nightly_hour = int(config.get(
+        "nightly_rollover_hour", DEFAULT_NIGHTLY_HOUR
+    ))
+    log.info(
+        "action=idle_monitor_start interval_s=%d mode=dynamic_triggers nightly_hour=%d",
+        interval, nightly_hour,
+    )
     while True:
         try:
             now = time.time()
@@ -756,7 +785,9 @@ async def idle_monitor(
                 "ORDER BY last_message_at ASC",
             ).fetchall()
             for row in rows:
-                do_rollover, trigger, threshold = should_rollover(row, now)
+                do_rollover, trigger, threshold = should_rollover(
+                    row, now, nightly_hour,
+                )
                 if do_rollover:
                     await trigger_rollover(
                         db,
@@ -768,6 +799,7 @@ async def idle_monitor(
                         threshold=threshold,
                         trigger=trigger,
                         context_window=context_window,
+                        nightly_hour=nightly_hour,
                     )
         except asyncio.CancelledError:
             raise

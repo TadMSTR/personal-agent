@@ -33,5 +33,10 @@ idle_check_interval_seconds: 60
 # Sized for the current Claude context window; lift if Anthropic ships a larger one.
 context_window_tokens: 200000
 
+# v0.3 — nightly rollover cutoff (local hour, 0–23). Sessions created before
+# the most recent occurrence of this hour are rolled over so each new day
+# starts with fresh sessions. Defaults to 4 (4:00 AM local).
+nightly_rollover_hour: 4
+
 # Optional: post a startup notification to the room when the manager comes up.
 startup_notify: true

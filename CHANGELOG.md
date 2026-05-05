@@ -5,14 +5,17 @@
 ### Added
 - Three OR'd rollover triggers replacing the fixed 1800s idle threshold (commit `e0d2018`):
   - `token_budget`: rollover at fill ≥ 80%
-  - `age_cap`: rollover at age > 24h
-  - `idle`: dynamic threshold (360s/1200s/1800s at fill ≥80% / ≥60% / else)
+  - `nightly_cutoff`: rollover when session was created before the last
+    `nightly_rollover_hour` boundary (default 4 AM local)
+  - `idle`: dynamic threshold (360s/1200s/1800s at fill ≥80% / ≥60% / else),
+    gated by a 40% minimum-fill floor
 - `get_token_fill_pct()`: estimates context fill from JSONL transcript
 - `idle_threshold_for_fill()`: maps fill to idle window
+- `last_nightly_cutoff()`: most recent local-time nightly_hour boundary
 - `should_rollover()`: per-session trigger evaluation, returns `(do_rollover, trigger, threshold)`
 - `update_token_fill()`: updates `sessions.token_fill_pct` after each claude exit
 - `context_window_tokens` config key (default 200000) — denominator for fill_pct
-- 5% minimum-fill floor on idle trigger to avoid wasted handoff on near-empty sessions (commit `d5e669c`)
+- `nightly_rollover_hour` config key (default 4) — wake-cycle aligned reset hour
 
 ### Changed
 - `idle_monitor()` now evaluates `should_rollover()` per active session instead of a fixed cutoff
