@@ -263,6 +263,14 @@ def get_session_by_event(db: sqlite3.Connection, event_id: str) -> sqlite3.Row |
     return None
 
 
+def get_latest_active_session(db: sqlite3.Connection) -> sqlite3.Row | None:
+    """Return the most recently active session, or None if no active session exists."""
+    return db.execute(
+        "SELECT * FROM sessions WHERE status = 'active' "
+        "ORDER BY last_message_at DESC LIMIT 1"
+    ).fetchone()
+
+
 def register_alias(
     db: sqlite3.Connection, event_id: str, thread_root_id: str
 ) -> None:
@@ -1043,8 +1051,121 @@ async def handle_event(
             event.event_id, thread_root,
         )
 
-    # Room-root (or orphaned reply) → spawn new session, atomically
+    # Room-root → resume active session if one exists, otherwise spawn new
     async with _room_lock:
+        active_row = get_latest_active_session(db)
+        if active_row is not None:
+            # Resume the existing session — same path as a thread reply
+            session_id = active_row["session_id"]
+            thread_root_id = active_row["thread_root_id"]
+            short_id = session_id[:8]
+            log.info(
+                "action=session_resume session_id=%s age_min=%.1f trigger=room_root",
+                short_id,
+                (time.time() - active_row["created_at"]) / 60.0,
+            )
+            # M2: re-fetch under lock — idle_monitor may have retired this session
+            fresh = db.execute(
+                "SELECT * FROM sessions WHERE session_id = ? AND status = 'active'",
+                (session_id,),
+            ).fetchone()
+            if fresh is None:
+                log.info(
+                    "action=session_rolled_over_during_handler session_id=%s",
+                    short_id,
+                )
+                active_row = None  # fall through to spawn
+            else:
+                now = time.time()
+                if now - _last_resume_at < RESUME_RATE_LIMIT_SECONDS:
+                    remaining = int(RESUME_RATE_LIMIT_SECONDS - (now - _last_resume_at))
+                    log.info(
+                        "action=resume_rate_limited session_id=%s wait_s=%d",
+                        short_id, remaining,
+                    )
+                    rate_event_id = await post_message(
+                        client, room_id,
+                        f"{mention} Still processing — retry in {remaining}s.",
+                        reply_to=event.event_id,
+                    )
+                    register_alias(db, rate_event_id, thread_root_id)
+                    return
+                _last_resume_at = now
+                ack_event_id = await post_message(
+                    client, room_id,
+                    f"Thinking... (session {short_id})",
+                    reply_to=event.event_id,
+                )
+                register_alias(db, ack_event_id, thread_root_id)
+                register_alias(db, event.event_id, thread_root_id)
+                start = time.time()
+                needs_handoff = (
+                    not fresh["handoff_injected"]
+                    and fresh["previous_session_id"]
+                )
+                try:
+                    if needs_handoff:
+                        prev_id = fresh["previous_session_id"]
+                        handoff_path = HANDOFFS_DIR / f"{prev_id}.md"
+                        handoff_text = (
+                            handoff_path.read_text(errors="replace")
+                            if handoff_path.exists() else ""
+                        )
+                        if len(handoff_text.encode()) > 16_000:
+                            handoff_text = (
+                                handoff_text[:16_000] + "\n[…handoff truncated…]"
+                            )
+                        full_message = (
+                            "[Session context — recent conversation summary "
+                            "and last messages:\n"
+                            f"{handoff_text}\n"
+                            "---]\n\n"
+                            f"{stamp(user_message)}"
+                        )
+                        log.info(
+                            "action=continuity_inject session_id=%s prev=%s "
+                            "handoff_bytes=%d",
+                            short_id, prev_id[:8], len(handoff_text),
+                        )
+                        with db:
+                            db.execute(
+                                "UPDATE sessions SET handoff_injected=1 "
+                                "WHERE session_id=?",
+                                (session_id,),
+                            )
+                        rc, output = await spawn_personal(
+                            session_id, full_message, project_dir,
+                            subprocess_timeout,
+                        )
+                    else:
+                        rc, output = await resume_personal(
+                            session_id, stamp(user_message), project_dir,
+                            subprocess_timeout,
+                        )
+                except asyncio.TimeoutError:
+                    log.error("action=resume_timeout session_id=%s", short_id)
+                    timeout_event_id = await post_message(
+                        client, room_id,
+                        f"{mention} Session {short_id} timed out after "
+                        f"{subprocess_timeout}s.",
+                        reply_to=ack_event_id or event.event_id,
+                    )
+                    register_alias(db, timeout_event_id, thread_root_id)
+                    return
+                update_token_fill(db, session_id, project_dir, context_window)
+                log.info(
+                    "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
+                    short_id, rc, time.time() - start,
+                )
+                await _post_response(
+                    client, room_id, output, rc, session_id, mention,
+                    max_message_length,
+                    reply_target=ack_event_id or event.event_id,
+                    db=db, thread_root_id=thread_root_id,
+                )
+                return
+
+        # No active session → spawn new
         now = time.time()
         if now - _last_spawn_at < RATE_LIMIT_SECONDS:
             remaining = int(RATE_LIMIT_SECONDS - (now - _last_spawn_at))
