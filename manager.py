@@ -787,31 +787,27 @@ async def trigger_rollover(
         # Orphan-session guard: a session created by a prior rollover that
         # never received a user message has no JSONL transcript. `claude -p
         # --resume` fails fast with "No conversation found", trigger_rollover
-        # aborts before retiring, and idle_monitor loops forever. Detect this
-        # case and retire-without-handoff: the new session starts cold with
-        # handoff_injected=1 so the next user message resumes normally.
+        # aborts before retiring, and idle_monitor loops forever.
+        #
+        # Retire-only — no new session created. The next user message will
+        # find no active session via get_latest_active_session() and hit the
+        # spawn-new path in handle_event, which correctly invokes
+        # spawn_personal with --session-id (not --resume). Creating a
+        # successor here is wrong: any flag combination (handoff_injected
+        # 0 or 1) leads to either resume-against-missing-transcript or
+        # spawn-with-empty-handoff against an already-allocated session_id.
         transcript = transcripts_dir(project_dir) / f"{session_id}.jsonl"
         if not transcript.exists():
-            new_id = str(uuid.uuid4())
-            now_ts = int(time.time())
             with db:
                 db.execute(
                     "UPDATE sessions SET status='retired' WHERE session_id=?",
                     (session_id,),
                 )
-                db.execute(
-                    """INSERT INTO sessions
-                         (session_id, thread_root_id, room_id, created_at,
-                          last_message_at, status, previous_session_id,
-                          handoff_injected)
-                       VALUES (?, ?, ?, ?, ?, 'active', ?, 1)""",
-                    (new_id, thread_root_id, room_id, now_ts, now_ts, session_id),
-                )
             log.info(
-                "action=rollover_no_transcript old=%s new=%s",
-                short_id, new_id[:8],
+                "action=rollover_no_transcript session_id=%s retire_only=true",
+                short_id,
             )
-            return new_id
+            return None
 
         try:
             rc, handoff_text = await resume_personal(
