@@ -24,9 +24,12 @@ v0.3 scope (added):
   - token_fill_pct updated in sessions table after each claude response.
   - idle_monitor now calls should_rollover() per session instead of a fixed cutoff.
 
+v0.4 scope (added):
+  - Typing indicators: client.room_typing before/after every claude invocation.
+  - Cold-start memsearch: first message of a brand-new session queries memsearch
+    for relevant prior context and prepends top results to the spawn message.
+
 Future phases extend this file:
-  v0.4 — typing indicators + cold-start memsearch injection
-  v0.4 — typing indicators + cold-start memsearch injection
   v0.5 — task-queue delegation + agent-bus event subscription
   v0.6 — Gitea-backed self-modification with locked-section validation
   v0.7 — sleep-window scripts (separate PM2 entries)
@@ -48,6 +51,7 @@ import os
 import re
 import signal
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -379,6 +383,23 @@ def stamp(message: str) -> str:
     return f"[{now.strftime('%A, %Y-%m-%d %H:%M %Z')}]\n\n{message}"
 
 
+def query_memsearch(query: str, max_results: int = 5) -> str:
+    """Shell out to memsearch and return result text, or empty string on failure."""
+    try:
+        result = subprocess.run(
+            ["memsearch", "search", query[:200], f"--limit={max_results}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        text = result.stdout.strip() if result.returncode == 0 else ""
+        # Cap at ~2000 tokens (≈8000 chars) to avoid bloating the spawn message
+        if len(text.encode()) > 8_000:
+            text = text[:8_000] + "\n[…memsearch results truncated…]"
+        return text
+    except Exception as e:
+        log.warning("action=memsearch_failed error_type=%s", type(e).__name__)
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # Subprocess — minimal env allowlist
 # ---------------------------------------------------------------------------
@@ -468,6 +489,20 @@ async def resume_personal(
          "--resume", session_id, message],
         project_dir, timeout, proc_key=session_id,
     )
+
+
+async def _typing_on(client: AsyncClient, room_id: str) -> None:
+    try:
+        await client.room_typing(room_id, typing=True, timeout=30000)
+    except Exception as e:
+        log.warning("action=typing_error phase=on error_type=%s", type(e).__name__)
+
+
+async def _typing_off(client: AsyncClient, room_id: str) -> None:
+    try:
+        await client.room_typing(room_id, typing=False)
+    except Exception as e:
+        log.warning("action=typing_error phase=off error_type=%s", type(e).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1016,7 @@ async def handle_event(
                     not row["handoff_injected"]
                     and row["previous_session_id"]
                 )
+                await _typing_on(client, room_id)
                 try:
                     if needs_handoff:
                         prev_id = row["previous_session_id"]
@@ -1033,6 +1069,8 @@ async def handle_event(
                     )
                     register_alias(db, timeout_event_id, thread_root_id)
                     return
+                finally:
+                    await _typing_off(client, room_id)
                 touch_session(db, session_id)
                 update_token_fill(db, session_id, project_dir, context_window)
                 log.info(
@@ -1103,6 +1141,7 @@ async def handle_event(
                     not fresh["handoff_injected"]
                     and fresh["previous_session_id"]
                 )
+                await _typing_on(client, room_id)
                 try:
                     if needs_handoff:
                         prev_id = fresh["previous_session_id"]
@@ -1152,6 +1191,8 @@ async def handle_event(
                     )
                     register_alias(db, timeout_event_id, thread_root_id)
                     return
+                finally:
+                    await _typing_off(client, room_id)
                 update_token_fill(db, session_id, project_dir, context_window)
                 log.info(
                     "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
@@ -1194,10 +1235,25 @@ async def handle_event(
         insert_session(db, session_id, event.event_id, room_id)
         register_alias(db, ack_event_id, event.event_id)
 
+        # v0.4: cold-start memsearch — prepend relevant prior context to first message
+        relevant_memory = query_memsearch(user_message)
+        if relevant_memory:
+            spawn_message = (
+                f"[Relevant prior context:\n{relevant_memory}\n---]\n\n"
+                f"{stamp(user_message)}"
+            )
+            log.info(
+                "action=memsearch_inject session_id=%s bytes=%d",
+                short_id, len(relevant_memory),
+            )
+        else:
+            spawn_message = stamp(user_message)
+
         start = time.time()
+        await _typing_on(client, room_id)
         try:
             rc, output = await spawn_personal(
-                session_id, stamp(user_message), project_dir,
+                session_id, spawn_message, project_dir,
                 subprocess_timeout,
             )
         except asyncio.TimeoutError:
@@ -1210,6 +1266,8 @@ async def handle_event(
             )
             register_alias(db, timeout_event_id, event.event_id)
             return
+        finally:
+            await _typing_off(client, room_id)
         update_token_fill(db, session_id, project_dir, context_window)
         log.info(
             "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
