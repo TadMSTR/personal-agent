@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.2] — 2026-05-08
+
+### Changed
+- Rollover triggers retuned for the actual usage pattern (one-off / few-turn Matrix
+  exchanges from phone). Sessions now live longer and only roll when truly necessary:
+  - `token_budget` threshold raised from 80% → 88% (~176k tokens; ~12-pt buffer to
+    Claude Code's auto-compaction at ~92–95%).
+  - `idle` collapsed to a single 10-min window, gated by `IDLE_MIN_FILL` raised from
+    40% → 75%. Sessions below 75% fill never roll over via the idle path.
+  - Nightly 4 AM cutoff replaced with a 7-day stale backstop. Catches truly forgotten
+    sessions without churning daily.
+- Removed `nightly_rollover_hour` config key (no longer read).
+- Removed `idle_threshold_for_fill()`, `last_nightly_cutoff()`, `DEFAULT_NIGHTLY_HOUR`
+  (replaced by flat `IDLE_THRESHOLD_SECS` / `STALE_MAX_AGE_SECS` constants).
+
 ## [0.4.1] — 2026-05-05
 
 ### Fixed
