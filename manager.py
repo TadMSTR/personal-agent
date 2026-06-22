@@ -1,45 +1,30 @@
-"""personal-agent manager — Matrix poll loop + claude-code session lifecycle.
+"""personal-agent manager — a continuous-conversation daemon over claude -p.
 
-v0.1 scope:
-  - Polls #personal:claudebox.me for messages from the operator only
-  - Spawns claude -p with --session-id on room-root messages
-  - Resumes on thread replies (matched via event_aliases)
-  - Timestamp-prefixes every user message before passing to claude
-  - Structured logs (no message body content)
-  - Posts response chunks back to Matrix with @ted mention on first chunk
+One Matrix room maps to one *continuous conversation*, backed by a chain of
+`claude -p` sessions. Context never compacts: the manager rolls to a fresh
+session before the auto-compact trigger (130k budget < 167k trigger) and bridges
+continuity with a raw last-N-turn handoff that it injects inline into the next
+session's first prompt. Deeper history is recalled on-demand by the agent via the
+platform's memory systems.
 
-v0.2 scope (added):
-  - Background idle monitor — sessions idle past idle_threshold_seconds are
-    rolled over: handoff summary generated via the live session, written to
-    handoffs/<session_id>.md, old session marked retired, new session_id
-    allocated against the same thread_root.
-  - Continuity injection — first user message after rollover is spawned (not
-    resumed) with the handoff text and last-10 transcript turns prepended.
-  - Multiple sessions per Matrix thread (status='active' filter); thread_root_id
-    no longer UNIQUE in sessions; event_aliases FK dropped (FK requires UNIQUE).
+This repo is persona-neutral. The deployment in `config.*.yml` decides the name
+(this one is "Harlock"); nothing in the code hard-codes it.
 
-v0.3 scope (added):
-  - Three OR'd rollover triggers: dynamic idle threshold (scales with token fill),
-    direct token-budget trigger at >=80% fill, 24-hour age cap.
-  - token_fill_pct updated in sessions table after each claude response.
-  - idle_monitor now calls should_rollover() per session instead of a fixed cutoff.
+Design notes / security posture (carried from matrix-dispatcher):
+  - Bot credentials come from env vars, asserted non-empty at startup. They never
+    flow into the agent subprocess (sudo scrubs env; we also pass a minimal
+    allowlist).
+  - All SQL is parameterized — no f-string SQL.
+  - session_id values are validated with uuid.UUID() before reaching argv
+    (--session-id / --resume).
+  - Logs carry event/room/session IDs, actions, exit codes — never message bodies.
+  - sessions.db (and WAL/SHM) are forced to mode 600.
 
-v0.4 scope (added):
-  - Typing indicators: client.room_typing before/after every claude invocation.
-  - Cold-start memsearch: first message of a brand-new session queries memsearch
-    for relevant prior context and prepends top results to the spawn message.
-
-Future phases extend this file:
-  v0.5 — task-queue delegation + agent-bus event subscription
-  v0.6 — Gitea-backed self-modification with locked-section validation
-  v0.7 — sleep-window scripts (separate PM2 entries)
-
-Hardening (mirrored from matrix-dispatcher):
-  - Subprocess env is a minimal allowlist; CLAUDE_API_KEY etc. never leak in
-  - SQLite uses parameterized queries throughout (no f-string SQL)
-  - Logs never carry message body, tool args, or Claude output
-  - requirements.txt pins exact versions
-  - Credentials loaded from env file (sourced by start.sh); asserted at startup
+Self-captured turns: because the agent runs as a *different, isolated* OS user
+whose transcripts are mode 0600, the manager cannot read the agent's JSONL. It
+does not need to: it owns the full stream-json stdout of every turn, so it
+persists each exchange into its own (ted-owned) `turns` table and builds the
+handoff tail, !recap, and idle-harvest notes from that.
 """
 
 from __future__ import annotations
@@ -48,37 +33,83 @@ import asyncio
 import json
 import logging
 import os
-import re
 import signal
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
 from nio import AsyncClient, RoomMessageText, SyncResponse
 
 # ---------------------------------------------------------------------------
-# Runtime state
+# Defaults (overridable per-deployment via config.yml)
 # ---------------------------------------------------------------------------
 
-_room_lock: asyncio.Lock | None = None  # set lazily in main()
+ROLLOVER_BUDGET = 130_000          # roll at this input-token fill. Default assumes
+                                   # the design model (Sonnet, 200k window; ~167k
+                                   # auto-compact trigger). Override via config
+                                   # `rollover_budget` if you pin a different model.
+SUBPROCESS_TIMEOUT_SECONDS = 600   # per-turn ceiling
+RATE_LIMIT_SECONDS = 3             # min gap between turns in a room (light guard)
+HANDOFF_TAIL_TURNS = 6             # raw turns carried across a rollover
+RECAP_DEFAULT_TURNS = 5
+RECAP_MAX_TURNS = 20
+
+# Pre-turn idle rollover: a thin, gone-cold context is cheaper to abandon than
+# resume. Fires only when a new message arrives after a long gap.
+IDLE_ROLLOVER_THRESHOLD_S = 3600   # 1h (cache TTL is ~1h)
+IDLE_ROLLOVER_FILL_FRACTION = 0.40 # only roll-on-idle if fill < 40% of budget
+
+# Nightly rollover cutoff (UTC hour). A session last used before today's cutoff
+# is rolled on the next inbound message so each "day" starts fresh.
+NIGHTLY_CUTOFF_HOUR_UTC = 4
+
+# Idle-harvest (archival): capture an idle session to the memsearch-indexed tier
+# and expire it. Independent of inbound messages.
+IDLE_HARVEST_THRESHOLD_S = 4200    # 70 min (just past the 1h cache TTL)
+IDLE_CHECK_INTERVAL = 300          # 5 min polling
+
+# Retention cleanup: prune rolled/expired sessions (and their turns/aliases).
+RETENTION_DAYS = 30
+CLEANUP_INTERVAL_SECONDS = 86400
+
+MAX_MESSAGE_CHARS = 32_000         # reject oversized inbound messages
+
+# Cancel-registration retry window (matches matrix-dispatcher).
+CANCEL_REGISTRATION_WAIT_SECONDS = 1.0
+CANCEL_POLL_INTERVAL_SECONDS = 0.05
+
+# --dangerously-skip-permissions: required for headless `claude -p` so MCP tool
+# calls don't dead-end on permission prompts that have no interactive UI. The
+# real per-call boundary is the scoped-mcp manifest (tool_allowlist +
+# argument_filters); settings.json permissions.allow is the secondary layer.
+# Proven pattern across forge's claude -p workloads.
+_CLAUDE_FLAGS = ["--dangerously-skip-permissions"]
+
+# ---------------------------------------------------------------------------
+# Runtime state (process-local; lost on restart — acceptable).
+# ---------------------------------------------------------------------------
+
+_room_locks: dict[str, asyncio.Lock] = {}
 _active_processes: dict[str, asyncio.subprocess.Process] = {}
-_last_spawn_at: float = 0.0
-_last_resume_at: float = 0.0
-_last_cleanup_at: float = 0.0
+_last_turn_at: dict[str, float] = {}
 _handlers: set[asyncio.Task] = set()
 
-DEFAULT_SUBPROCESS_TIMEOUT = 1800
-DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
-RATE_LIMIT_SECONDS = 5
-RESUME_RATE_LIMIT_SECONDS = 3
-CLEANUP_INTERVAL_SECONDS = 3600
+
+def _room_lock(room_id: str) -> asyncio.Lock:
+    if room_id not in _room_locks:
+        _room_locks[room_id] = asyncio.Lock()
+    return _room_locks[room_id]
+
 
 # ---------------------------------------------------------------------------
-# Logging — structured, no message body content
+# Logging — no message bodies
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -88,14 +119,19 @@ logging.basicConfig(
 )
 log = logging.getLogger("personal-agent")
 
+
 # ---------------------------------------------------------------------------
-# Paths and config
+# Configuration
 # ---------------------------------------------------------------------------
 
-CONFIG_PATH = Path(__file__).parent / "config.yml"
-DATA_DIR = Path.home() / ".claude" / "data" / "personal-agent"
-DB_PATH = DATA_DIR / "sessions.db"
-HANDOFFS_DIR = DATA_DIR / "handoffs"
+CONFIG_PATH = Path(os.environ.get(
+    "PERSONAL_AGENT_CONFIG",
+    str(Path(__file__).parent / "config.yml"),
+))
+DB_PATH = Path(os.environ.get(
+    "PERSONAL_AGENT_DB",
+    str(Path.home() / ".claude" / "data" / "personal-agent" / "sessions.db"),
+))
 
 
 def load_config() -> dict:
@@ -103,8 +139,18 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    """Write to a .tmp (mode 600 from creation) then rename — readers never see
+    a partial file, and there is no world-readable window (FW-01)."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    tmp.replace(path)
+
+
 # ---------------------------------------------------------------------------
-# SQLite layer — parameterized queries throughout
+# DB layer — parameterized queries throughout
 # ---------------------------------------------------------------------------
 
 def open_db() -> sqlite3.Connection:
@@ -120,213 +166,214 @@ def open_db() -> sqlite3.Connection:
     return db
 
 
-def _sessions_has_unique_thread_root(db: sqlite3.Connection) -> bool:
-    row = db.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
-    ).fetchone()
-    return bool(row) and "UNIQUE" in (row["sql"] or "")
-
-
 def init_db(db: sqlite3.Connection) -> None:
-    # Fresh-install path. CREATE IF NOT EXISTS preserves any prior schema —
-    # the migration block below handles the v0.1 → v0.2 reshape.
     db.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
-          session_id          TEXT PRIMARY KEY,
-          thread_root_id      TEXT NOT NULL,
-          room_id             TEXT NOT NULL,
-          created_at          INTEGER NOT NULL,
-          last_message_at     INTEGER NOT NULL,
-          token_fill_pct      REAL DEFAULT 0.0,
-          status              TEXT DEFAULT 'active',
-          previous_session_id TEXT,
-          handoff_injected    INTEGER DEFAULT 0
+          session_id      TEXT PRIMARY KEY,
+          room_id         TEXT NOT NULL,
+          state           TEXT NOT NULL,      -- 'active' | 'rolled' | 'expired'
+          thread_root_id  TEXT,
+          prev_session_id TEXT,
+          fill_tokens     INTEGER DEFAULT 0,
+          turn_count      INTEGER DEFAULT 0,
+          created_at      INTEGER NOT NULL,
+          last_used_at    INTEGER NOT NULL,
+          rolled_reason   TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_sessions_last_msg ON sessions(last_message_at);
-        CREATE INDEX IF NOT EXISTS idx_sessions_thread_root ON sessions(thread_root_id);
-        CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+        -- DB-enforced single active session per room (race guard).
+        CREATE UNIQUE INDEX IF NOT EXISTS one_active_per_room
+          ON sessions(room_id) WHERE state='active';
+        CREATE INDEX IF NOT EXISTS idx_sessions_room ON sessions(room_id, last_used_at);
 
-        -- Maps any manager-posted event_id (ack, response chunks) back to a
-        -- thread_root, so replies to those events resolve to the right active
-        -- session. v0.2: FK removed because thread_root_id is no longer UNIQUE
-        -- (multiple sessions per thread: at most one active + N retired).
+        -- Self-captured conversation, built from stream-json stdout. This is the
+        -- manager's own copy — the agent's JSONL is unreadable (0600, isolated user).
+        CREATE TABLE IF NOT EXISTS turns (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id     TEXT NOT NULL,
+          room_id        TEXT NOT NULL,
+          turn_index     INTEGER NOT NULL,
+          user_text      TEXT NOT NULL,
+          assistant_text TEXT NOT NULL,
+          tools_used     TEXT DEFAULT '',
+          fill_tokens    INTEGER DEFAULT 0,
+          created_at     INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, turn_index);
+
+        -- Carried from matrix-dispatcher: reply-to-event resolution + poll cursor.
         CREATE TABLE IF NOT EXISTS event_aliases (
-          event_id       TEXT PRIMARY KEY,
-          thread_root_id TEXT NOT NULL
+          event_id   TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          room_id    TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_event_aliases_thread_root
-          ON event_aliases(thread_root_id);
-
         CREATE TABLE IF NOT EXISTS poll_state (
-          id         INTEGER PRIMARY KEY CHECK (id = 1),
+          room_id    TEXT PRIMARY KEY,
           since      TEXT NOT NULL,
           updated_at INTEGER NOT NULL
         );
     """)
-
-    # v0.1 → v0.2 migration: drop UNIQUE on sessions.thread_root_id and the
-    # event_aliases FK that depended on it. Recreates both tables in place.
-    # Wrapped in explicit BEGIN/COMMIT so a process kill during migration
-    # rolls back to the v0.1 schema rather than leaving sessions dropped
-    # before the rename completes.
-    if _sessions_has_unique_thread_root(db):
-        log.info("action=schema_migration from=v0.1 to=v0.2")
-        db.executescript("""
-            BEGIN;
-            DROP TABLE IF EXISTS sessions_new;
-            DROP TABLE IF EXISTS event_aliases_new;
-
-            CREATE TABLE sessions_new (
-              session_id          TEXT PRIMARY KEY,
-              thread_root_id      TEXT NOT NULL,
-              room_id             TEXT NOT NULL,
-              created_at          INTEGER NOT NULL,
-              last_message_at     INTEGER NOT NULL,
-              token_fill_pct      REAL DEFAULT 0.0,
-              status              TEXT DEFAULT 'active',
-              previous_session_id TEXT,
-              handoff_injected    INTEGER DEFAULT 0
-            );
-            INSERT INTO sessions_new SELECT * FROM sessions;
-            DROP TABLE sessions;
-            ALTER TABLE sessions_new RENAME TO sessions;
-            CREATE INDEX idx_sessions_last_msg ON sessions(last_message_at);
-            CREATE INDEX idx_sessions_thread_root ON sessions(thread_root_id);
-            CREATE INDEX idx_sessions_status ON sessions(status);
-
-            CREATE TABLE event_aliases_new (
-              event_id       TEXT PRIMARY KEY,
-              thread_root_id TEXT NOT NULL
-            );
-            INSERT INTO event_aliases_new SELECT event_id, thread_root_id FROM event_aliases;
-            DROP TABLE event_aliases;
-            ALTER TABLE event_aliases_new RENAME TO event_aliases;
-            CREATE INDEX idx_event_aliases_thread_root ON event_aliases(thread_root_id);
-            COMMIT;
-        """)
-
     db.commit()
 
 
+# --- poll cursor -----------------------------------------------------------
+
 def get_since(db: sqlite3.Connection) -> str | None:
-    row = db.execute("SELECT since FROM poll_state WHERE id = 1").fetchone()
+    row = db.execute(
+        "SELECT since FROM poll_state WHERE room_id = ?", ("global",)
+    ).fetchone()
     return row["since"] if row else None
 
 
 def set_since(db: sqlite3.Connection, since: str) -> None:
     db.execute(
-        "INSERT OR REPLACE INTO poll_state (id, since, updated_at) VALUES (1, ?, ?)",
-        (since, int(time.time())),
+        "INSERT OR REPLACE INTO poll_state (room_id, since, updated_at) VALUES (?, ?, ?)",
+        ("global", since, int(time.time())),
     )
     db.commit()
+
+
+# --- sessions --------------------------------------------------------------
+
+def get_active_session(db: sqlite3.Connection, room_id: str) -> sqlite3.Row | None:
+    return db.execute(
+        "SELECT * FROM sessions WHERE room_id = ? AND state = 'active'", (room_id,)
+    ).fetchone()
+
+
+def get_session(db: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
+    return db.execute(
+        "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+
+
+def last_rolled_session(db: sqlite3.Connection, room_id: str) -> sqlite3.Row | None:
+    """Most recent non-active session in a room — the chain backref for a new one."""
+    return db.execute(
+        "SELECT * FROM sessions WHERE room_id = ? AND state != 'active' "
+        "ORDER BY last_used_at DESC LIMIT 1",
+        (room_id,),
+    ).fetchone()
 
 
 def insert_session(
     db: sqlite3.Connection,
     session_id: str,
-    thread_root_id: str,
     room_id: str,
+    thread_root_id: str | None,
+    prev_session_id: str | None,
 ) -> None:
     now = int(time.time())
     db.execute(
         """INSERT INTO sessions
-           (session_id, thread_root_id, room_id, created_at, last_message_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (session_id, thread_root_id, room_id, now, now),
+           (session_id, room_id, state, thread_root_id, prev_session_id,
+            fill_tokens, turn_count, created_at, last_used_at, rolled_reason)
+           VALUES (?, ?, 'active', ?, ?, 0, 0, ?, ?, NULL)""",
+        (session_id, room_id, thread_root_id, prev_session_id, now, now),
     )
     db.commit()
 
 
-def touch_session(db: sqlite3.Connection, session_id: str) -> None:
-    db.execute(
-        "UPDATE sessions SET last_message_at = ? WHERE session_id = ?",
-        (int(time.time()), session_id),
-    )
-    db.commit()
-
-
-def get_session_by_event(db: sqlite3.Connection, event_id: str) -> sqlite3.Row | None:
-    """Resolve any event_id (thread root, ack, or response chunk) to the active
-    session for that thread. Retired rows are ignored."""
-    row = db.execute(
-        "SELECT * FROM sessions WHERE thread_root_id = ? AND status = 'active'",
-        (event_id,),
-    ).fetchone()
-    if row:
-        return row
-    alias = db.execute(
-        "SELECT thread_root_id FROM event_aliases WHERE event_id = ?", (event_id,)
-    ).fetchone()
-    if alias:
-        return db.execute(
-            "SELECT * FROM sessions "
-            "WHERE thread_root_id = ? AND status = 'active'",
-            (alias["thread_root_id"],),
-        ).fetchone()
-    return None
-
-
-def get_latest_active_session(db: sqlite3.Connection) -> sqlite3.Row | None:
-    """Return the most recently active session, or None if no active session exists."""
-    return db.execute(
-        "SELECT * FROM sessions WHERE status = 'active' "
-        "ORDER BY last_message_at DESC LIMIT 1"
-    ).fetchone()
-
-
-def register_alias(
-    db: sqlite3.Connection, event_id: str, thread_root_id: str
+def update_session_after_turn(
+    db: sqlite3.Connection, session_id: str, fill_tokens: int,
 ) -> None:
+    db.execute(
+        "UPDATE sessions SET fill_tokens = ?, turn_count = turn_count + 1, "
+        "last_used_at = ? WHERE session_id = ?",
+        (fill_tokens, int(time.time()), session_id),
+    )
+    db.commit()
+
+
+def mark_session(db: sqlite3.Connection, session_id: str, state: str, reason: str) -> None:
+    db.execute(
+        "UPDATE sessions SET state = ?, rolled_reason = ? WHERE session_id = ?",
+        (state, reason, session_id),
+    )
+    db.commit()
+
+
+# --- turns -----------------------------------------------------------------
+
+def insert_turn(
+    db: sqlite3.Connection,
+    session_id: str,
+    room_id: str,
+    turn_index: int,
+    user_text: str,
+    assistant_text: str,
+    tools_used: str,
+    fill_tokens: int,
+) -> None:
+    db.execute(
+        """INSERT INTO turns
+           (session_id, room_id, turn_index, user_text, assistant_text,
+            tools_used, fill_tokens, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (session_id, room_id, turn_index, user_text, assistant_text,
+         tools_used, fill_tokens, int(time.time())),
+    )
+    db.commit()
+
+
+def turns_for_session(db: sqlite3.Connection, session_id: str) -> list[sqlite3.Row]:
+    return db.execute(
+        "SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC",
+        (session_id,),
+    ).fetchall()
+
+
+def last_n_turns_across_chain(
+    db: sqlite3.Connection, session_id: str, n: int,
+) -> list[sqlite3.Row]:
+    """Collect the last n turns walking prev_session_id backward across rollovers."""
+    collected: list[sqlite3.Row] = []
+    sid: str | None = session_id
+    seen: set[str] = set()
+    while sid and sid not in seen and len(collected) < n:
+        seen.add(sid)
+        rows = db.execute(
+            "SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index DESC",
+            (sid,),
+        ).fetchall()
+        for row in rows:
+            collected.append(row)
+            if len(collected) >= n:
+                break
+        sess = get_session(db, sid)
+        sid = sess["prev_session_id"] if sess else None
+    collected.reverse()  # chronological
+    return collected
+
+
+# --- event aliases ---------------------------------------------------------
+
+def register_alias(db: sqlite3.Connection, event_id: str, session_id: str, room_id: str) -> None:
     if not event_id:
         return
     db.execute(
-        "INSERT OR IGNORE INTO event_aliases (event_id, thread_root_id) VALUES (?, ?)",
-        (event_id, thread_root_id),
+        "INSERT OR IGNORE INTO event_aliases (event_id, session_id, room_id) VALUES (?, ?, ?)",
+        (event_id, session_id, room_id),
     )
     db.commit()
 
 
-def cleanup_old_sessions(db: sqlite3.Connection, retention_days: int) -> None:
-    cutoff = int(time.time()) - (retention_days * 86400)
-    with db:
-        deleted = db.execute(
-            "DELETE FROM sessions WHERE last_message_at < ?", (cutoff,)
-        ).rowcount
-        # Orphan aliases: with FK gone, prune aliases whose thread_root_id
-        # has no surviving session row.
-        orphans = db.execute(
-            "DELETE FROM event_aliases WHERE thread_root_id NOT IN "
-            "(SELECT thread_root_id FROM sessions)"
-        ).rowcount
-    if deleted or orphans:
-        log.info(
-            "action=session_cleanup deleted=%d alias_orphans=%d retention_days=%d",
-            deleted, orphans, retention_days,
-        )
-
-
 # ---------------------------------------------------------------------------
-# Credentials — assert at startup
+# Credentials — assert non-empty at startup
 # ---------------------------------------------------------------------------
 
-def get_credentials() -> tuple[str, str, str, str]:
-    homeserver = os.environ.get("PERSONAL_HOMESERVER", "").strip()
-    user_id = os.environ.get("PERSONAL_USER_ID", "").strip()
-    token = os.environ.get("PERSONAL_ACCESS_TOKEN", "").strip()
-    room_id = os.environ.get("PERSONAL_ROOM_ID", "").strip()
-
+def get_credentials() -> tuple[str, str, str]:
+    homeserver = os.environ.get("PERSONAL_AGENT_HOMESERVER", "").strip()
+    user_id = os.environ.get("PERSONAL_AGENT_USER_ID", "").strip()
+    token = os.environ.get("PERSONAL_AGENT_ACCESS_TOKEN", "").strip()
     missing = [k for k, v in [
-        ("PERSONAL_HOMESERVER", homeserver),
-        ("PERSONAL_USER_ID", user_id),
-        ("PERSONAL_ACCESS_TOKEN", token),
-        ("PERSONAL_ROOM_ID", room_id),
+        ("PERSONAL_AGENT_HOMESERVER", homeserver),
+        ("PERSONAL_AGENT_USER_ID", user_id),
+        ("PERSONAL_AGENT_ACCESS_TOKEN", token),
     ] if not v]
-
     if missing:
-        log.error("action=startup_error missing_var=%s", ",".join(missing))
+        log.error("Missing required env vars at startup: %s", ", ".join(missing))
         sys.exit(1)
-
-    return homeserver, user_id, token, room_id
+    return homeserver, user_id, token
 
 
 # ---------------------------------------------------------------------------
@@ -334,10 +381,7 @@ def get_credentials() -> tuple[str, str, str, str]:
 # ---------------------------------------------------------------------------
 
 async def post_message(
-    client: AsyncClient,
-    room_id: str,
-    body: str,
-    reply_to: str | None = None,
+    client: AsyncClient, room_id: str, body: str, reply_to: str | None = None,
 ) -> str:
     content: dict = {"msgtype": "m.text", "body": body}
     if reply_to:
@@ -352,9 +396,8 @@ def split_on_paragraphs(text: str, max_len: int) -> list[str]:
     if len(text) <= max_len:
         return [text]
     chunks: list[str] = []
-    paragraphs = text.split("\n\n")
     current = ""
-    for para in paragraphs:
+    for para in text.split("\n\n"):
         candidate = (current + "\n\n" + para).lstrip("\n") if current else para
         if len(candidate) <= max_len:
             current = candidate
@@ -373,108 +416,67 @@ def split_on_paragraphs(text: str, max_len: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Timestamp injection — every user message is stamped before reaching claude
-# ---------------------------------------------------------------------------
-
-def stamp(message: str) -> str:
-    """Prepend the current local time so the agent always knows when it is."""
-    now = datetime.now().astimezone()
-    return f"[{now.strftime('%A, %Y-%m-%d %H:%M %Z')}]\n\n{message}"
-
-
-async def query_memsearch(query: str, max_results: int = 5) -> str:
-    """Shell out to memsearch and return result text, or empty string on failure.
-
-    M1: async subprocess so the event loop is not blocked while memsearch runs.
-    L1: passes _minimal_env() so memsearch does not inherit MATRIX_TOKEN /
-        CLAUDE_API_KEY / other secrets from the manager process env.
-    L3: byte-aware truncation — encode → byte-slice → decode with errors=replace.
-    """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "memsearch", "search", query[:200], f"--limit={max_results}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_minimal_env(),
-        )
-        try:
-            stdout_b, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=15,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            try:
-                await proc.communicate()
-            except Exception:
-                pass
-            log.warning("action=memsearch_failed error_type=TimeoutError")
-            return ""
-        if proc.returncode != 0:
-            return ""
-        text = stdout_b.decode(errors="replace").strip()
-        encoded = text.encode("utf-8", errors="replace")
-        if len(encoded) > 8_000:
-            text = (
-                encoded[:8_000].decode("utf-8", errors="replace")
-                + "\n[…memsearch results truncated…]"
-            )
-        return text
-    except Exception as e:
-        log.warning("action=memsearch_failed error_type=%s", type(e).__name__)
-        return ""
-
-
-def _sanitize_memsearch(text: str) -> str:
-    """L2: drop any line containing the closing delimiter so adversarial
-    memory content cannot break out of the [Relevant prior context: ...---]
-    block. Cheap defense-in-depth; nonce-delimited block deferred."""
-    if not text:
-        return text
-    return "\n".join(line for line in text.splitlines() if "---]" not in line)
-
-
-# ---------------------------------------------------------------------------
-# Subprocess — minimal env allowlist
+# Subprocess launch — minimal env; sudo to the isolated agent user
 # ---------------------------------------------------------------------------
 
 def _minimal_env() -> dict[str, str]:
+    """Minimal, explicit env for the launcher. sudo scrubs most of it anyway;
+    the agent's own settings.json supplies CLAUDE_CODE_* / proxy / langfuse vars.
+    The bot Matrix token is deliberately NOT included."""
     env = {
-        "HOME": os.environ["HOME"],
-        "PATH": os.environ["PATH"],
-        "AGENT_ID": "personal",
-        "AGENT_TYPE": "personal-agent",
+        "HOME": os.environ.get("HOME", ""),
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "LANG": os.environ.get("LANG", "en_US.UTF-8"),
         "TERM": os.environ.get("TERM", "xterm"),
         "USER": os.environ.get("USER", "ted"),
     }
-    # Explicit allowlist — never glob CLAUDE_*, which would leak any
-    # CLAUDE_API_KEY / CLAUDE_CODE_OAUTH_TOKEN into agent subprocesses.
-    for key in ("CLAUDE_CONFIG_DIR",):
-        if key in os.environ:
-            env[key] = os.environ[key]
-    return env
+    return {k: v for k, v in env.items() if v}
 
 
-async def _run_claude(
-    args: list[str],
-    project_dir: str,
+def _launch_args(deploy: dict, *, session_id: str, resume: bool, prompt: str) -> list[str]:
+    """Build the argv for a turn. session_id is uuid-validated before this is called."""
+    claude_bin = deploy["claude_bin"]
+    agent_user = deploy.get("agent_user")
+    base: list[str]
+    if agent_user:
+        # NOPASSWD sudoers grant is scoped to exactly claude_bin as agent_user.
+        base = ["sudo", "-n", "-u", agent_user, "--", claude_bin]
+    else:
+        base = [claude_bin]
+    # Pin the model from config so the rollover math (which assumes a known
+    # context window) holds regardless of the host's default model. The design
+    # targets Sonnet (200k window); the 130k budget sits below its ~167k
+    # auto-compact trigger. Leaving this unset inherits the host default (opus
+    # 4.8 [1m], 1M window) for which these numbers do NOT apply.
+    model_flag = ["--model", deploy["model"]] if deploy.get("model") else []
+    session_flag = ["--resume", session_id] if resume else ["--session-id", session_id]
+    return base + ["-p", *_CLAUDE_FLAGS, *model_flag, *session_flag,
+                   "--output-format", "stream-json", "--verbose", prompt]
+
+
+def _validate_session_id(session_id: str) -> None:
+    """Reject anything that is not a UUID before it reaches argv."""
+    uuid.UUID(session_id)
+
+
+async def run_claude(
+    deploy: dict, room_id: str, *, session_id: str, resume: bool, prompt: str,
     timeout: int,
-    proc_key: str,
 ) -> tuple[int, str]:
-    """Run claude with the given args; register PID for /cancel-style intervention."""
+    """Run one turn. Returns (exit_code, raw_stdout). Raises asyncio.TimeoutError."""
+    _validate_session_id(session_id)
+    args = _launch_args(deploy, session_id=session_id, resume=resume, prompt=prompt)
     proc = await asyncio.create_subprocess_exec(
         *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=project_dir,
+        stdin=asyncio.subprocess.DEVNULL,  # prompt is an argv positional; closing
+        stdout=asyncio.subprocess.PIPE,    # stdin avoids claude's 3s stdin wait and
+        stderr=asyncio.subprocess.PIPE,    # any block when run headless under PM2.
+        cwd=deploy["project_dir"],
         env=_minimal_env(),
     )
-    _active_processes[proc_key] = proc
+    _active_processes[room_id] = proc
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout,
-        )
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
@@ -484,46 +486,82 @@ async def _run_claude(
             pass
         raise
     finally:
-        _active_processes.pop(proc_key, None)
+        _active_processes.pop(room_id, None)
     rc = proc.returncode if proc.returncode is not None else -1
-    stdout = stdout_b.decode(errors="replace").strip()
-    stderr = stderr_b.decode(errors="replace").strip()
-    if rc == 0:
-        output = stdout
-    else:
-        log.error("action=claude_error rc=%d stderr=%s", rc, stderr)
-        output = f"[Error: claude exited with code {rc}]"
-    return rc, output
+    stdout = stdout_b.decode(errors="replace")
+    if rc != 0:
+        stderr = stderr_b.decode(errors="replace").strip()
+        # Log stderr to PM2 logs; do NOT surface it to Matrix (L1: OE-02 — paths may appear).
+        log.error("action=claude_nonzero room=%s session=%s rc=%d stderr_preview=%r",
+                  room_id, session_id, rc, stderr[:200])
+        return rc, stdout if stdout.strip() else stderr[:1000]
+    return rc, stdout
 
 
-# --dangerously-skip-permissions: required for headless claude -p so MCP tool
-# calls don't dead-end on prompts that have no interactive UI to answer them.
-# This is the proven pattern used by memory-sync-weekly.sh, memory-promote-daily.sh,
-# librarian.sh, and other production claude -p workloads on this host.
-# permissions.allow in settings.json is the secondary scoping layer; the actual
-# per-call boundary is the scoped-mcp manifest (tool_allowlist + argument_filters).
-_CLAUDE_FLAGS = ["--dangerously-skip-permissions"]
+# ---------------------------------------------------------------------------
+# stream-json parsing
+# ---------------------------------------------------------------------------
+
+def _blocks_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = block.get("text", "")
+                if isinstance(t, str):
+                    parts.append(t)
+        return "\n".join(parts)
+    return ""
 
 
-async def spawn_personal(
-    session_id: str, message: str, project_dir: str, timeout: int,
-) -> tuple[int, str]:
-    return await _run_claude(
-        ["claude", "-p", *_CLAUDE_FLAGS,
-         "--session-id", session_id, message],
-        project_dir, timeout, proc_key=session_id,
-    )
+def parse_stream_json(stdout: str) -> dict:
+    """Extract the response text, token fill, and tool names from stream-json.
+
+    Returns {"text": str, "fill": int, "tools": list[str], "is_error": bool}.
+    fill = input-side context size of this turn = the current context size,
+    because claude re-sends the full history each turn.
+    """
+    text = ""
+    fill = 0
+    tools: list[str] = []
+    is_error = False
+    seen_tools: set[str] = set()
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        otype = obj.get("type")
+        if otype == "assistant":
+            msg = obj.get("message", {}) or {}
+            for block in msg.get("content", []) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = block.get("name")
+                    if isinstance(name, str) and name not in seen_tools:
+                        seen_tools.add(name)
+                        tools.append(name)
+        elif otype == "result":
+            is_error = bool(obj.get("is_error")) or obj.get("subtype") != "success"
+            result_text = obj.get("result")
+            if isinstance(result_text, str) and result_text:
+                text = result_text
+            usage = obj.get("usage") or {}
+            fill = (
+                int(usage.get("input_tokens", 0) or 0)
+                + int(usage.get("cache_read_input_tokens", 0) or 0)
+                + int(usage.get("cache_creation_input_tokens", 0) or 0)
+            )
+    return {"text": text.strip(), "fill": fill, "tools": tools, "is_error": is_error}
 
 
-async def resume_personal(
-    session_id: str, message: str, project_dir: str, timeout: int,
-) -> tuple[int, str]:
-    return await _run_claude(
-        ["claude", "-p", *_CLAUDE_FLAGS,
-         "--resume", session_id, message],
-        project_dir, timeout, proc_key=session_id,
-    )
-
+# ---------------------------------------------------------------------------
+# Typing indicators
+# ---------------------------------------------------------------------------
 
 async def _typing_on(client: AsyncClient, room_id: str) -> None:
     try:
@@ -540,801 +578,681 @@ async def _typing_off(client: AsyncClient, room_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# v0.2 — transcript reader + rollover
+# Cold-start memsearch injection (carried from v0.4)
 # ---------------------------------------------------------------------------
 
-def transcripts_dir(project_dir: str) -> Path:
-    """Map a project_dir to its Claude Code transcript directory.
-    Path is encoded by replacing every non-alphanumeric / non-hyphen char with
-    a hyphen — the same encoding Claude Code itself uses."""
-    encoded = re.sub(r"[^a-zA-Z0-9-]", "-", project_dir)
-    return Path.home() / ".claude" / "projects" / encoded
+async def query_memsearch(deploy: dict, query: str, max_results: int = 5) -> str:
+    """Shell out to the memsearch CLI; return result text or '' on failure.
 
-
-def read_last_n_turns(
-    session_id: str, project_dir: str, n: int = 10, max_bytes: int = 32_000
-) -> str:
-    """Return last N user/assistant turns from a session's JSONL transcript
-    as plain text, or empty string if the transcript is missing or unparsable.
-    Truncates to max_bytes to prevent ARG_MAX overflow in continuity injection."""
-    transcript = transcripts_dir(project_dir) / f"{session_id}.jsonl"
-    if not transcript.exists():
+    Async subprocess (no event-loop block); minimal env so no secret leaks;
+    byte-aware truncation. Degrades silently — injection is best-effort."""
+    memsearch_bin = deploy.get("memsearch_bin")
+    if not memsearch_bin:
         return ""
-    turns: list[str] = []
     try:
-        for line in transcript.read_text(errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            msg_type = entry.get("type")
-            message = entry.get("message") or {}
-            content = message.get("content")
-            if msg_type == "user" and isinstance(content, str):
-                turns.append(f"[user] {content}")
-            elif msg_type == "assistant" and isinstance(content, list):
-                texts = [
-                    c.get("text", "")
-                    for c in content
-                    if isinstance(c, dict) and c.get("type") == "text"
-                ]
-                joined = " ".join(t for t in texts if t).strip()
-                if joined:
-                    turns.append(f"[assistant] {joined}")
-    except OSError as exc:
-        log.warning("action=transcript_read_error session=%s err=%s",
-                    session_id[:8], exc)
-        return ""
-    result = "\n\n".join(turns[-n:])
-    if len(result.encode()) > max_bytes:
-        result = "[…truncated…]\n\n" + result[-max_bytes:]
-    return result
-
-
-def get_token_fill_pct(
-    session_id: str,
-    project_dir: str,
-    context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
-) -> float:
-    """Estimate context fill from the latest transcript entry's usage.
-    Returns 0.0–1.0.
-
-    Claude Code uses prompt caching, so per-turn `input_tokens` reflects only new
-    content; the bulk of context lives in `cache_read_input_tokens` and
-    `cache_creation_input_tokens`. The true fill at any moment is the sum of
-    those three on the latest entry that carries usage. Reverse-scan the file
-    and break on the first such entry."""
-    transcript = transcripts_dir(project_dir) / f"{session_id}.jsonl"
-    if not transcript.exists():
-        return 0.0
-    try:
-        lines = transcript.read_text(errors="replace").splitlines()
-    except OSError:
-        return 0.0
-    for line in reversed(lines):
-        if not line.strip():
-            continue
+        proc = await asyncio.create_subprocess_exec(
+            memsearch_bin, "search", query[:200], f"--limit={max_results}",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_minimal_env(),
+        )
         try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        usage = (obj.get("message") or {}).get("usage") or {}
-        if not usage:
-            continue
-        total = (
-            usage.get("input_tokens", 0)
-            + usage.get("cache_creation_input_tokens", 0)
-            + usage.get("cache_read_input_tokens", 0)
-        )
-        if total <= 0:
-            continue
-        return min(total / context_window, 1.0)
-    return 0.0
+            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            try:
+                await proc.communicate()
+            except Exception:
+                pass
+            log.warning("action=memsearch_failed error_type=TimeoutError")
+            return ""
+        if proc.returncode != 0:
+            return ""
+        text = stdout_b.decode(errors="replace").strip()
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) > 8_000:
+            text = encoded[:8_000].decode("utf-8", errors="replace") \
+                + "\n[…memsearch results truncated…]"
+        return text
+    except Exception as e:
+        log.warning("action=memsearch_failed error_type=%s", type(e).__name__)
+        return ""
 
 
-IDLE_MIN_FILL = 0.75            # idle trigger only fires once context is meaningfully full
-IDLE_THRESHOLD_SECS = 600       # 10 min — single window for idle rollover
-TOKEN_BUDGET_PCT = 0.88         # rollover threshold; ~12-pt buffer to ~92-95% compaction
-STALE_MAX_AGE_SECS = 7 * 86400  # 7d backstop for sessions that never fill or go idle
+def _sanitize_injection(text: str) -> str:
+    """Drop any line containing the closing delimiter so adversarial memory /
+    summary content cannot break out of a `[… ---]` injection block."""
+    if not text:
+        return text
+    return "\n".join(line for line in text.splitlines() if "---]" not in line)
 
 
-def should_rollover(
-    row: sqlite3.Row,
-    now: float,
-) -> tuple[bool, str, int]:
-    """Return (should_rollover, trigger_name, idle_threshold_used).
+# ---------------------------------------------------------------------------
+# Ollama handoff summarizer (with raw-tail fallback)
+# ---------------------------------------------------------------------------
 
-    Three OR'd triggers:
-      token_budget — fill >= TOKEN_BUDGET_PCT (88%); rollover before compaction
-      stale        — session age exceeds STALE_MAX_AGE_SECS (7d) backstop
-      idle         — idle > IDLE_THRESHOLD_SECS AND fill >= IDLE_MIN_FILL (75%)
-    """
-    fill = row["token_fill_pct"] or 0.0
-    idle_secs = now - row["last_message_at"]
-    age_secs = now - row["created_at"]
-
-    if fill >= TOKEN_BUDGET_PCT:
-        return True, "token_budget", IDLE_THRESHOLD_SECS
-    if age_secs >= STALE_MAX_AGE_SECS:
-        return True, "stale", IDLE_THRESHOLD_SECS
-    if idle_secs > IDLE_THRESHOLD_SECS and fill >= IDLE_MIN_FILL:
-        return True, "idle", IDLE_THRESHOLD_SECS
-    return False, "", IDLE_THRESHOLD_SECS
-
-
-def update_token_fill(
-    db: sqlite3.Connection,
-    session_id: str,
-    project_dir: str,
-    context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
-) -> float:
-    """Read transcript, update token_fill_pct in sessions table, return new value."""
-    fill = get_token_fill_pct(session_id, project_dir, context_window)
-    with db:
-        db.execute(
-            "UPDATE sessions SET token_fill_pct=? WHERE session_id=?",
-            (fill, session_id),
-        )
-    if fill >= 0.70:
-        log.info("action=token_fill_updated session_id=%s fill_pct=%.3f",
-                 session_id[:8], fill)
-    return fill
-
-
-HANDOFF_TIMEOUT_SECONDS = 300  # 5 min ceiling for ~400-word summary
-
-HANDOFF_PROMPT = (
-    "Summarize this conversation as a handoff to your future self. "
-    "Include: open threads, user state, decisions made, next steps. "
-    "Prioritize fast-changing state (open tasks, pending delegations, "
-    "unresolved questions, recent decisions) over stable facts — stable "
-    "facts are already in memsearch and don't need regenerating. "
-    "Be specific. ~400 words. Plain text only."
+OLLAMA_HANDOFF_PROMPT = (
+    "Summarize this conversation as a handoff to your future self continuing the "
+    "same chat. Capture open threads, pending tasks/delegations, decisions made, "
+    "user state, and next steps. Prioritize fast-changing state over stable facts "
+    "(stable facts are recoverable from memory search). Be specific and terse. "
+    "Plain text, no preamble, under 250 words.\n\nConversation:\n"
 )
 
 
-async def trigger_rollover(
-    db: sqlite3.Connection,
-    session_id: str,
-    thread_root_id: str,
-    room_id: str,
-    project_dir: str,
-    subprocess_timeout: int,
-    threshold: int,
-    trigger: str = "idle",
-    context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
-) -> str | None:
-    """Generate handoff, retire old session, allocate new session_id (do NOT
-    spawn). Returns new_session_id on success, None on failure (old session
-    stays active so the next user message resumes normally).
+def _ollama_summarize_sync(deploy: dict, conversation: str) -> str:
+    """Blocking Ollama call — run via asyncio.to_thread. Returns '' on any failure."""
+    url = deploy.get("ollama_url")
+    model = deploy.get("ollama_model")
+    if not url or not model:
+        return ""
+    payload = json.dumps({
+        "model": model,
+        "prompt": OLLAMA_HANDOFF_PROMPT + conversation,
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }).encode()
+    req = urllib.request.Request(
+        url.rstrip("/") + "/api/generate", data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=deploy.get("ollama_timeout", 60)) as resp:
+            data = json.loads(resp.read().decode(errors="replace"))
+        return (data.get("response") or "").strip()
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as e:
+        log.warning("action=ollama_summarize_failed error_type=%s", type(e).__name__)
+        return ""
 
-    Acquires _room_lock for the duration of the resume_personal call so a
-    concurrent user message handler can't run a second `claude -p --resume`
-    against the same session_id and corrupt the shared JSONL transcript."""
-    assert _room_lock is not None
-    short_id = session_id[:8]
-    log.info("action=rollover_start session_id=%s trigger=%s", short_id, trigger)
-    async with _room_lock:
-        # Recheck the trigger-specific condition under the lock. A user message
-        # may have arrived between snapshot and lock-acquire, but for
-        # token_budget and stale that doesn't disqualify the rollover — only
-        # the idle trigger cares about freshness.
-        fresh = db.execute(
-            "SELECT last_message_at, created_at, status FROM sessions "
-            "WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        if not fresh or fresh["status"] != "active":
-            log.info("action=rollover_skip_stale session_id=%s reason=inactive",
-                     short_id)
-            return None
-        now_int = int(time.time())
-        if trigger == "idle":
-            if fresh["last_message_at"] >= now_int - threshold:
-                log.info("action=rollover_skip_stale session_id=%s reason=idle_reset",
-                         short_id)
-                return None
-        elif trigger == "token_budget":
-            current_fill = get_token_fill_pct(session_id, project_dir, context_window)
-            if current_fill < TOKEN_BUDGET_PCT:
-                log.info(
-                    "action=rollover_skip_stale session_id=%s reason=fill_drop fill=%.3f",
-                    short_id, current_fill,
-                )
-                return None
-        elif trigger == "stale":
-            if (now_int - fresh["created_at"]) < STALE_MAX_AGE_SECS:
-                log.info(
-                    "action=rollover_skip_stale session_id=%s reason=not_stale",
-                    short_id,
-                )
-                return None
 
-        # Orphan-session guard: a session created by a prior rollover that
-        # never received a user message has no JSONL transcript. `claude -p
-        # --resume` fails fast with "No conversation found", trigger_rollover
-        # aborts before retiring, and idle_monitor loops forever.
-        #
-        # Retire-only — no new session created. The next user message will
-        # find no active session via get_latest_active_session() and hit the
-        # spawn-new path in handle_event, which correctly invokes
-        # spawn_personal with --session-id (not --resume). Creating a
-        # successor here is wrong: any flag combination (handoff_injected
-        # 0 or 1) leads to either resume-against-missing-transcript or
-        # spawn-with-empty-handoff against an already-allocated session_id.
-        transcript = transcripts_dir(project_dir) / f"{session_id}.jsonl"
-        if not transcript.exists():
-            with db:
-                db.execute(
-                    "UPDATE sessions SET status='retired' WHERE session_id=?",
-                    (session_id,),
-                )
-            log.info(
-                "action=rollover_no_transcript session_id=%s retire_only=true",
-                short_id,
-            )
-            return None
+async def summarize_handoff(deploy: dict, turns: list[sqlite3.Row]) -> str:
+    """Ollama summary of the tail, or '' if disabled/unavailable (caller falls
+    back to the raw tail)."""
+    if not turns or not deploy.get("ollama_model"):
+        return ""
+    convo = _render_tail(turns)
+    summary = await asyncio.to_thread(_ollama_summarize_sync, deploy, convo)
+    return _sanitize_injection(summary)
 
-        try:
-            rc, handoff_text = await resume_personal(
-                session_id, HANDOFF_PROMPT, project_dir, HANDOFF_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            log.error("action=rollover_handoff_timeout session_id=%s", short_id)
-            return None
-        if rc != 0:
-            log.error("action=rollover_handoff_error session_id=%s rc=%d",
-                      short_id, rc)
-            return None
 
-        last_10 = read_last_n_turns(session_id, project_dir, n=10)
+# ---------------------------------------------------------------------------
+# Per-turn datetime tag
+# ---------------------------------------------------------------------------
 
-        HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
-        handoff_path = HANDOFFS_DIR / f"{session_id}.md"
-        # Atomic write: stage to .tmp with mode 0o600 from creation (no
-        # permissions window), then rename. Guarantees readers see either the
-        # prior content or the complete new content, never a partial file.
-        tmp_path = handoff_path.with_suffix(".md.tmp")
+def _fmt_delta(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"+{seconds}s since last"
+    mins = seconds // 60
+    if mins < 60:
+        return f"+{mins}m since last"
+    hours = mins // 60
+    rem = mins % 60
+    if hours < 24:
+        return f"+{hours}h{rem:02d}m since last"
+    days = hours // 24
+    return f"+{days}d{hours % 24}h since last"
+
+
+def datetime_tag(now_unix: float, last_used_at: int | None, tz_name: str) -> str:
+    tz = ZoneInfo(tz_name)
+    stamp = datetime.fromtimestamp(now_unix, tz).strftime("%Y-%m-%d %H:%M %Z")
+    if last_used_at:
+        delta = _fmt_delta(now_unix - last_used_at)
+    else:
+        delta = "first message"
+    return f"[time: {stamp} | {delta}]"
+
+
+# ---------------------------------------------------------------------------
+# Rollover + warm-context bridge
+# ---------------------------------------------------------------------------
+
+def _render_tail(turns: list[sqlite3.Row]) -> str:
+    out = []
+    for t in turns:
+        out.append(f"**Ted:**\n{t['user_text']}")
+        out.append(f"**You (Harlock):**\n{t['assistant_text']}")
+    return "\n\n".join(out)
+
+
+def write_rollover_note(deploy: dict, sess: sqlite3.Row, turns: list[sqlite3.Row]) -> str:
+    """Write a durable raw-tail handoff note to the manager's (ted-owned)
+    memsearch-indexed working tier. Returns the path (or '' on failure)."""
+    note_dir = Path(deploy["working_note_dir"])
+    try:
+        note_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("action=rollover_note_dir_error err=%s", e)
+        return ""
+    short = sess["session_id"][:8]
+    path = note_dir / f"rollover-{short}.md"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    expires = datetime.fromtimestamp(
+        time.time() + 90 * 86400, timezone.utc
+    ).strftime("%Y-%m-%d")
+    body = (
+        f"---\n"
+        f"tier: working\n"
+        f"created: {today}\n"
+        f"source: {deploy['name']}\n"
+        f"expires: {expires}\n"
+        f"tags: [{deploy['name']}, rollover, handoff]\n"
+        f"session_id: {sess['session_id']}\n"
+        f"prev_session_id: {sess['prev_session_id'] or ''}\n"
+        f"---\n\n"
+        f"# Rollover handoff — session {short}\n\n"
+        f"Continuous conversation rolled to a fresh session "
+        f"(reason: {sess['rolled_reason'] or 'token_budget'}). "
+        f"Raw last {len(turns)} turns for warm continuity:\n\n"
+        f"{_render_tail(turns)}\n"
+    )
+    try:
+        _atomic_write(path, body)
+    except OSError as e:
+        log.warning("action=rollover_note_write_error err=%s", e)
+        return ""
+    return str(path)
+
+
+def roll_over(db: sqlite3.Connection, deploy: dict, sess: sqlite3.Row, reason: str) -> None:
+    tail = last_n_turns_across_chain(db, sess["session_id"], HANDOFF_TAIL_TURNS)
+    mark_session(db, sess["session_id"], "rolled", reason)
+    note = write_rollover_note(deploy, _row_with(sess, "rolled_reason", reason), tail)
+    log.info(
+        "action=rollover room=%s session=%s reason=%s tail_turns=%d note=%s",
+        sess["room_id"], sess["session_id"], reason, len(tail), bool(note),
+    )
+
+
+def _row_with(row: sqlite3.Row, key: str, value) -> dict:
+    d = dict(row)
+    d[key] = value
+    return d
+
+
+async def build_warm_prefix(
+    db: sqlite3.Connection, prev_session_id: str | None, deploy: dict,
+) -> str:
+    """Inline handoff injected into a fresh session's first prompt.
+
+    The agent runs as an isolated user, so we cannot write a file into its home
+    for a SessionStart hook to pick up — we hand the bridge to it directly.
+    Prefer an Ollama summary of the tail; always include the last 2 raw turns
+    for immediate continuity; fall back to the full raw tail if Ollama is off
+    or unavailable."""
+    if not prev_session_id:
+        return ""
+    tail = last_n_turns_across_chain(db, prev_session_id, HANDOFF_TAIL_TURNS)
+    if not tail:
+        return ""
+    summary = await summarize_handoff(deploy, tail)
+    if summary:
         body = (
-            f"# Handoff from session {short_id}\n\n"
-            f"{handoff_text}\n\n"
-            f"## Last 10 messages\n\n{last_10}\n"
+            f"Summary of the prior context:\n{summary}\n\n"
+            f"Most recent turns verbatim:\n{_sanitize_injection(_render_tail(tail[-2:]))}"
         )
-        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(body)
-        tmp_path.replace(handoff_path)
-
-        new_id = str(uuid.uuid4())
-        now_ts = int(time.time())
-        with db:
-            db.execute(
-                "UPDATE sessions SET status='retired' WHERE session_id=?",
-                (session_id,),
-            )
-            db.execute(
-                """INSERT INTO sessions
-                     (session_id, thread_root_id, room_id, created_at,
-                      last_message_at, status, previous_session_id,
-                      handoff_injected)
-                   VALUES (?, ?, ?, ?, ?, 'active', ?, 0)""",
-                (new_id, thread_root_id, room_id, now_ts, now_ts, session_id),
-            )
-    log.info(
-        "action=rollover_complete old=%s new=%s handoff_bytes=%d",
-        short_id, new_id[:8], len(body),
+    else:
+        body = f"Recent turns verbatim:\n{_sanitize_injection(_render_tail(tail))}"
+    return (
+        "[Continuity handoff — this is a fresh session continuing an ongoing "
+        "conversation. The prior context was rolled to stay below the compaction "
+        "limit; it was NOT lost. Use memsearch/qmd to recall anything older.\n"
+        f"{body}\n---]\n\n[Current message:]\n"
     )
-    return new_id
 
 
-async def idle_monitor(
-    db: sqlite3.Connection,
-    config: dict,
-) -> None:
-    """Background task — every idle_check_interval_seconds, evaluate all active
-    sessions against three OR'd triggers (token_budget, age_cap, idle) and roll
-    over any that qualify."""
-    interval = int(config.get("idle_check_interval_seconds", 60))
-    project_dir = config["project_dir"]
-    subprocess_timeout = int(config.get(
-        "subprocess_timeout_seconds", DEFAULT_SUBPROCESS_TIMEOUT
-    ))
-    context_window = int(config.get(
-        "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS
-    ))
-    log.info(
-        "action=idle_monitor_start interval_s=%d mode=dynamic_triggers "
-        "token_budget_pct=%.2f idle_min_fill=%.2f stale_days=%d",
-        interval, TOKEN_BUDGET_PCT, IDLE_MIN_FILL,
-        STALE_MAX_AGE_SECS // 86400,
+# ---------------------------------------------------------------------------
+# Pre-turn roll decision
+# ---------------------------------------------------------------------------
+
+def _past_nightly_cutoff(last_used_at: int, now_unix: float) -> bool:
+    now_dt = datetime.fromtimestamp(now_unix, timezone.utc)
+    cutoff = now_dt.replace(
+        hour=NIGHTLY_CUTOFF_HOUR_UTC, minute=0, second=0, microsecond=0
     )
+    if now_dt < cutoff:
+        # Before today's cutoff — the boundary that matters is yesterday's.
+        cutoff -= timedelta(days=1)
+    return last_used_at < cutoff.timestamp()
+
+
+def should_roll_preturn(sess: sqlite3.Row, now_unix: float) -> str | None:
+    idle = now_unix - sess["last_used_at"]
+    if _past_nightly_cutoff(sess["last_used_at"], now_unix):
+        return "nightly"
+    if (idle > IDLE_ROLLOVER_THRESHOLD_S
+            and sess["fill_tokens"] < ROLLOVER_BUDGET * IDLE_ROLLOVER_FILL_FRACTION):
+        return "idle"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Idle-harvest (Phase 7 steps 1 & 3 — step 2 is the scoped systemd janitor)
+# ---------------------------------------------------------------------------
+
+def render_session_note(deploy: dict, sess: sqlite3.Row, turns: list[sqlite3.Row]) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    expires = datetime.fromtimestamp(
+        time.time() + 90 * 86400, timezone.utc
+    ).strftime("%Y-%m-%d")
+    created_iso = datetime.fromtimestamp(sess["created_at"], timezone.utc).isoformat()
+    last_iso = datetime.fromtimestamp(sess["last_used_at"], timezone.utc).isoformat()
+    all_tools: list[str] = []
+    for t in turns:
+        for name in (t["tools_used"] or "").split(","):
+            name = name.strip()
+            if name and name not in all_tools:
+                all_tools.append(name)
+    first_user = turns[0]["user_text"][:120] if turns else ""
+    last_user = turns[-1]["user_text"][:120] if turns else ""
+    tail = _render_tail(turns[-4:]) if turns else "(no turns)"
+    return (
+        f"---\n"
+        f"tier: session\n"
+        f"created: {today}\n"
+        f"source: {deploy['name']}\n"
+        f"expires: {expires}\n"
+        f"tags: [{deploy['name']}, session, {today}]\n"
+        f"session_id: {sess['session_id']}\n"
+        f"prev_session_id: {sess['prev_session_id'] or ''}\n"
+        f"---\n\n"
+        f"## Conversation\n"
+        f"- **Date:** {created_iso} → {last_iso}\n"
+        f"- **Turns:** {sess['turn_count']}\n"
+        f"- **Tools used:** {', '.join(all_tools) or '(none)'}\n"
+        f"- **Topics:** {first_user} … {last_user}\n\n"
+        f"## Recent context (last 4 turns)\n{tail}\n"
+    )
+
+
+def harvest_session(db: sqlite3.Connection, deploy: dict, sess: sqlite3.Row) -> None:
+    turns = turns_for_session(db, sess["session_id"])
+    note_dir = Path(deploy["session_note_dir"])
+    short = sess["session_id"][:8]
+    try:
+        note_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write(note_dir / f"{deploy['name']}-session-{short}.md",
+                      render_session_note(deploy, sess, turns))
+        wrote = True
+    except OSError as e:
+        log.warning("action=harvest_note_error session=%s err=%s", sess["session_id"], e)
+        wrote = False
+    mark_session(db, sess["session_id"], "expired", "idle_harvest")
+    log.info(
+        "action=harvest room=%s session=%s note=%s (jsonl cold-archive handled "
+        "by scoped agent-user janitor)",
+        sess["room_id"], sess["session_id"], wrote,
+    )
+
+
+async def idle_harvest_loop(db: sqlite3.Connection, deploy: dict) -> None:
+    while True:
+        await asyncio.sleep(IDLE_CHECK_INTERVAL)
+        try:
+            now = int(time.time())
+            rows = db.execute(
+                "SELECT * FROM sessions WHERE state = 'active' "
+                "AND ? - last_used_at > ?",
+                (now, IDLE_HARVEST_THRESHOLD_S),
+            ).fetchall()
+            for sess in rows:
+                # Don't harvest a session mid-turn.
+                if _active_processes.get(sess["room_id"]) is not None:
+                    continue
+                async with _room_lock(sess["room_id"]):
+                    fresh = get_session(db, sess["session_id"])
+                    if fresh and fresh["state"] == "active":
+                        harvest_session(db, deploy, fresh)
+        except Exception:
+            log.exception("action=idle_harvest_error")
+
+
+def run_cleanup(db: sqlite3.Connection, retention_days: int) -> tuple[int, int]:
+    """Delete non-active sessions older than retention, plus their turns and
+    orphaned aliases. Active sessions are never pruned."""
+    cutoff = int(time.time()) - retention_days * 86400
+    with db:
+        gone = db.execute(
+            "SELECT session_id FROM sessions WHERE state != 'active' AND last_used_at < ?",
+            (cutoff,),
+        ).fetchall()
+        ids = [r["session_id"] for r in gone]
+        for sid in ids:
+            db.execute("DELETE FROM turns WHERE session_id = ?", (sid,))
+            db.execute("DELETE FROM event_aliases WHERE session_id = ?", (sid,))
+            db.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+    if ids:
+        log.info("action=cleanup sessions_deleted=%d retention_days=%d",
+                 len(ids), retention_days)
+    return len(ids), 0
+
+
+async def cleanup_loop(db: sqlite3.Connection, retention_days: int) -> None:
     while True:
         try:
-            now = time.time()
-            rows = db.execute(
-                "SELECT session_id, thread_root_id, room_id, "
-                "last_message_at, created_at, token_fill_pct "
-                "FROM sessions WHERE status='active' "
-                "ORDER BY last_message_at ASC",
-            ).fetchall()
-            for row in rows:
-                do_rollover, trigger, threshold = should_rollover(row, now)
-                if do_rollover:
-                    await trigger_rollover(
-                        db,
-                        session_id=row["session_id"],
-                        thread_root_id=row["thread_root_id"],
-                        room_id=row["room_id"],
-                        project_dir=project_dir,
-                        subprocess_timeout=subprocess_timeout,
-                        threshold=threshold,
-                        trigger=trigger,
-                        context_window=context_window,
-                    )
-        except asyncio.CancelledError:
-            raise
+            run_cleanup(db, retention_days)
         except Exception:
-            log.exception("action=idle_monitor_error")
-        await asyncio.sleep(interval)
+            log.exception("action=cleanup_error")
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
-# Thread / reply resolution
+# Commands
 # ---------------------------------------------------------------------------
 
-def extract_thread_root(event: RoomMessageText) -> str | None:
-    """Return the thread-root event ID for a reply, or None for a room-root message."""
-    source = getattr(event, "source", {})
-    content = source.get("content", {}) if isinstance(source, dict) else {}
-    relates_to = content.get("m.relates_to")
-    if not isinstance(relates_to, dict):
-        return None
-    candidate: object | None = None
-    if relates_to.get("rel_type") == "m.thread":
-        candidate = relates_to.get("event_id")
-    else:
-        in_reply_to = relates_to.get("m.in_reply_to")
-        if isinstance(in_reply_to, dict):
-            candidate = in_reply_to.get("event_id")
-    if candidate is None:
-        return None
-    if not isinstance(candidate, str):
-        log.warning(
-            "action=malformed_relates_to event_id=%s type=%s",
-            getattr(event, "event_id", "?"), type(candidate).__name__,
-        )
-        return None
-    return candidate
+HELP_TEXT = (
+    "Commands (! prefix — Element intercepts /-commands client-side):\n"
+    "  !recap [N]   — last N turns across rollover boundaries (default 5)\n"
+    "  !sessions    — recent sessions in this room\n"
+    "  !cancel      — SIGTERM the active turn in this room\n"
+    "  !mirror      — adopt the most recent unmirrored local session (deployment-dependent)\n"
+    "  !help        — this message\n\n"
+    "Otherwise just talk — every message continues the one ongoing conversation."
+)
 
 
-# ---------------------------------------------------------------------------
-# Response posting
-# ---------------------------------------------------------------------------
+def _parse_n(arg: str, default: int, lo: int, hi: int) -> int:
+    try:
+        n = int(arg.strip())
+    except ValueError:
+        return default
+    return max(lo, min(n, hi))
 
-async def _post_response(
-    client: AsyncClient,
-    room_id: str,
-    output: str,
-    exit_code: int,
-    session_id: str,
-    mention: str,
-    max_message_length: int,
-    reply_target: str,
-    db: sqlite3.Connection,
-    thread_root_id: str,
-) -> None:
-    short_id = session_id[:8]
-    if exit_code != 0:
-        event_id = await post_message(
-            client, room_id,
-            f"{mention} Session {short_id} error:\n\n{output}",
-            reply_to=reply_target,
-        )
-        register_alias(db, event_id, thread_root_id)
+
+async def handle_help(client, room_id, event, mention_user) -> None:
+    log.info("action=cmd_help room=%s event_id=%s", room_id, event.event_id)
+    await post_message(client, room_id, f"{mention_user}\n\n{HELP_TEXT}", reply_to=event.event_id)
+
+
+async def handle_recap(client, room_id, event, mention_user, db, max_len, arg) -> None:
+    n = _parse_n(arg, RECAP_DEFAULT_TURNS, 1, RECAP_MAX_TURNS)
+    log.info("action=cmd_recap room=%s event_id=%s n=%d", room_id, event.event_id, n)
+    latest = db.execute(
+        "SELECT * FROM sessions WHERE room_id = ? ORDER BY last_used_at DESC LIMIT 1",
+        (room_id,),
+    ).fetchone()
+    if latest is None:
+        await post_message(client, room_id, f"{mention_user} No prior conversation to recap.",
+                           reply_to=event.event_id)
         return
-    if not output:
-        output = "(no output)"
-    chunks = split_on_paragraphs(output, max_message_length)
-    for i, chunk in enumerate(chunks):
-        text = f"{mention} {chunk}" if i == 0 else chunk
-        event_id = await post_message(client, room_id, text, reply_to=reply_target)
-        register_alias(db, event_id, thread_root_id)
+    turns = last_n_turns_across_chain(db, latest["session_id"], n)
+    if not turns:
+        await post_message(client, room_id, f"{mention_user} No readable turns yet.",
+                           reply_to=event.event_id)
+        return
+    header = f"{mention_user} Recap — last {len(turns)} turns (across rollovers):\n\n"
+    for chunk in split_on_paragraphs(header + _render_tail(turns), max_len):
+        await post_message(client, room_id, chunk, reply_to=event.event_id)
+
+
+async def handle_sessions(client, room_id, event, mention_user, db) -> None:
+    log.info("action=cmd_sessions room=%s event_id=%s", room_id, event.event_id)
+    rows = db.execute(
+        "SELECT * FROM sessions WHERE room_id = ? ORDER BY last_used_at DESC LIMIT 10",
+        (room_id,),
+    ).fetchall()
+    if not rows:
+        await post_message(client, room_id, f"{mention_user} No sessions yet in this room.",
+                           reply_to=event.event_id)
+        return
+    lines = [f"{mention_user} Recent sessions in this room:"]
+    for i, r in enumerate(rows, 1):
+        last = datetime.fromtimestamp(r["last_used_at"], timezone.utc).strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"{i}. ({r['session_id'][:8]}) {r['state']} · {r['turn_count']} turns · "
+            f"~{r['fill_tokens']//1000}k · {last}Z · {r['rolled_reason'] or '-'}"
+        )
+    await post_message(client, room_id, "\n".join(lines), reply_to=event.event_id)
+
+
+async def handle_cancel(client, room_id, event, mention_user) -> None:
+    proc = _active_processes.get(room_id)
+    if proc is None:
+        lock = _room_locks.get(room_id)
+        if lock is not None and lock.locked():
+            elapsed = 0.0
+            while elapsed < CANCEL_REGISTRATION_WAIT_SECONDS:
+                await asyncio.sleep(CANCEL_POLL_INTERVAL_SECONDS)
+                elapsed += CANCEL_POLL_INTERVAL_SECONDS
+                proc = _active_processes.get(room_id)
+                if proc is not None:
+                    break
+    if proc is None:
+        log.info("action=cmd_cancel_noop room=%s event_id=%s", room_id, event.event_id)
+        await post_message(client, room_id, f"{mention_user} No active turn in this room.",
+                           reply_to=event.event_id)
+        return
+    pid = proc.pid
+    log.info("action=cmd_cancel room=%s event_id=%s pid=%s", room_id, event.event_id, pid)
+    try:
+        proc.send_signal(signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    await post_message(client, room_id, f"{mention_user} Sent SIGTERM to active turn (pid {pid}).",
+                       reply_to=event.event_id)
+
+
+def find_unmirrored_session_id(db, deploy, room_id) -> str | None:
+    """Most recent JSONL in project_dir not already tracked. uuid-validated.
+
+    In an isolated deployment (agent runs as a different user, transcripts 0600)
+    the manager cannot read these — this naturally returns None there."""
+    project_dir = deploy["project_dir"]
+    encoded = project_dir.replace("/", "-")
+    jsonl_dir = Path(deploy["agent_home"]) / ".claude" / "projects" / encoded \
+        if deploy.get("agent_home") else Path.home() / ".claude" / "projects" / encoded
+    if not jsonl_dir.exists():
+        return None
+    known = {r["session_id"] for r in db.execute(
+        "SELECT session_id FROM sessions WHERE room_id = ?", (room_id,)).fetchall()}
+    candidates = []
+    try:
+        for path in jsonl_dir.glob("*.jsonl"):
+            if path.stem in known:
+                continue
+            try:
+                uuid.UUID(path.stem)
+            except ValueError:
+                continue
+            candidates.append(path)
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime).stem
+
+
+async def handle_mirror(client, room_id, event, mention_user, db, deploy) -> None:
+    log.info("action=cmd_mirror room=%s event_id=%s", room_id, event.event_id)
+    session_id = find_unmirrored_session_id(db, deploy, room_id)
+    if session_id is None:
+        await post_message(
+            client, room_id,
+            f"{mention_user} No unmirrored local session found "
+            f"(expected in this isolated deployment — the agent's transcripts "
+            f"aren't manager-readable).",
+            reply_to=event.event_id)
+        return
+    # Adopt it as the room's active session (close any existing active first).
+    existing = get_active_session(db, room_id)
+    if existing:
+        mark_session(db, existing["session_id"], "rolled", "mirror_replaced")
+    insert_session(db, session_id, room_id, event.event_id, None)
+    await post_message(
+        client, room_id,
+        f"{mention_user} Adopted session {session_id[:8]} as active. Reply to continue.",
+        reply_to=event.event_id)
 
 
 # ---------------------------------------------------------------------------
-# Event handler
+# Core message handling — continuous-session flow
 # ---------------------------------------------------------------------------
 
 async def handle_event(
     client: AsyncClient,
     room_id: str,
     event: RoomMessageText,
-    operator_user_id: str,
-    project_dir: str,
-    db: sqlite3.Connection,
+    deploy: dict,
+    trusted_sender: str,
+    mention_user: str,
     max_message_length: int,
-    subprocess_timeout: int,
-    context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
+    db: sqlite3.Connection,
+    timeout: int,
 ) -> None:
-    global _last_spawn_at, _room_lock
-    assert _room_lock is not None
-
-    # Sender gate — silently drop non-operator messages
-    if event.sender != operator_user_id:
+    if event.sender != trusted_sender:
         return
 
-    log.info(
-        "action=message_received room=%s sender=%s msg_len=%d is_thread=%s event_id=%s",
-        room_id, event.sender, len(event.body or ""),
-        bool(extract_thread_root(event)), event.event_id,
-    )
+    user_message = event.body.strip()
 
-    user_message = (event.body or "").strip()
+    # Commands (room-level; "!" prefix because Element eats "/").
+    if user_message.startswith("!"):
+        parts = user_message.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
+        if cmd == "!help":
+            await handle_help(client, room_id, event, mention_user)
+        elif cmd == "!recap":
+            await handle_recap(client, room_id, event, mention_user, db, max_message_length, arg)
+        elif cmd == "!sessions":
+            await handle_sessions(client, room_id, event, mention_user, db)
+        elif cmd == "!cancel":
+            await handle_cancel(client, room_id, event, mention_user)
+        elif cmd == "!mirror":
+            await handle_mirror(client, room_id, event, mention_user, db, deploy)
+        else:
+            await post_message(client, room_id,
+                               f"{mention_user} Unknown command `{cmd}`. Send `!help`.",
+                               reply_to=event.event_id)
+        return
+
     if not user_message:
         return
-    if len(user_message) > 32_000:
+    if len(user_message) > MAX_MESSAGE_CHARS:
         await post_message(
             client, room_id,
-            f"Message too long ({len(user_message):,} chars, limit is 32,000).",
-            reply_to=event.event_id,
-        )
+            f"{mention_user} Message too long ({len(user_message):,} chars, "
+            f"limit {MAX_MESSAGE_CHARS:,}).",
+            reply_to=event.event_id)
         return
-    thread_root = extract_thread_root(event)
-    mention = operator_user_id  # @ted mention on first chunk
 
-    # Thread reply → resume the matching session
-    if thread_root is not None:
-        row = get_session_by_event(db, thread_root)
-        if row is not None:
-            session_id = row["session_id"]
-            thread_root_id = row["thread_root_id"]
-            short_id = session_id[:8]
-            log.info(
-                "action=session_resume session_id=%s age_min=%.1f",
-                short_id,
-                (time.time() - row["created_at"]) / 60.0,
-            )
-            queue_depth = len(_handlers)
-            if queue_depth > 3:
-                log.warning(
-                    "action=handler_queue_depth depth=%d session_id=%s",
-                    queue_depth, short_id,
-                )
-            ack_event_id = await post_message(
-                client, room_id,
-                f"Thinking... (session {short_id})",
-                reply_to=event.event_id,
-            )
-            register_alias(db, ack_event_id, thread_root_id)
-            async with _room_lock:
-                # M2: re-fetch session row under lock — idle_monitor may have
-                # rolled over this session between get_session_by_event() and
-                # lock-acquire. Use fresh data for all subsequent logic.
-                fresh = get_session_by_event(db, thread_root)
-                if fresh is None or fresh["session_id"] != row["session_id"]:
-                    row = fresh
-                    if row is None:
-                        log.info(
-                            "action=session_rolled_over_during_handler "
-                            "thread=%s", thread_root[:8],
-                        )
-                        return
-                    session_id = row["session_id"]
-                    thread_root_id = row["thread_root_id"]
-                    short_id = session_id[:8]
-                global _last_resume_at
-                now = time.time()
-                if now - _last_resume_at < RESUME_RATE_LIMIT_SECONDS:
-                    remaining = int(RESUME_RATE_LIMIT_SECONDS - (now - _last_resume_at))
-                    log.info(
-                        "action=resume_rate_limited session_id=%s wait_s=%d",
-                        short_id, remaining,
-                    )
-                    rate_event_id = await post_message(
-                        client, room_id,
-                        f"{mention} Still processing — retry in {remaining}s.",
-                        reply_to=ack_event_id or event.event_id,
-                    )
-                    register_alias(db, rate_event_id, thread_root_id)
-                    return
-                _last_resume_at = now
-                start = time.time()
-                needs_handoff = (
-                    not row["handoff_injected"]
-                    and row["previous_session_id"]
-                )
-                await _typing_on(client, room_id)
-                try:
-                    if needs_handoff:
-                        prev_id = row["previous_session_id"]
-                        handoff_path = HANDOFFS_DIR / f"{prev_id}.md"
-                        handoff_text = (
-                            handoff_path.read_text(errors="replace")
-                            if handoff_path.exists() else ""
-                        )
-                        # L3: cap handoff_text to prevent oversized CLI args
-                        if len(handoff_text.encode()) > 16_000:
-                            handoff_text = (
-                                handoff_text[:16_000] + "\n[…handoff truncated…]"
-                            )
-                        full_message = (
-                            "[Session context — recent conversation summary "
-                            "and last messages:\n"
-                            f"{handoff_text}\n"
-                            "---]\n\n"
-                            f"{stamp(user_message)}"
-                        )
-                        log.info(
-                            "action=continuity_inject session_id=%s prev=%s "
-                            "handoff_bytes=%d",
-                            short_id, prev_id[:8], len(handoff_text),
-                        )
-                        # L1: set handoff_injected before spawn so a
-                        # TimeoutError doesn't cause double-injection on retry
-                        with db:
-                            db.execute(
-                                "UPDATE sessions SET handoff_injected=1 "
-                                "WHERE session_id=?",
-                                (session_id,),
-                            )
-                        rc, output = await spawn_personal(
-                            session_id, full_message, project_dir,
-                            subprocess_timeout,
-                        )
-                    else:
-                        rc, output = await resume_personal(
-                            session_id, stamp(user_message), project_dir,
-                            subprocess_timeout,
-                        )
-                except asyncio.TimeoutError:
-                    log.error("action=resume_timeout session_id=%s", short_id)
-                    timeout_event_id = await post_message(
-                        client, room_id,
-                        f"{mention} Session {short_id} timed out after "
-                        f"{subprocess_timeout}s.",
-                        reply_to=ack_event_id or event.event_id,
-                    )
-                    register_alias(db, timeout_event_id, thread_root_id)
-                    return
-                finally:
-                    await _typing_off(client, room_id)
-                touch_session(db, session_id)
-                update_token_fill(db, session_id, project_dir, context_window)
-                log.info(
-                    "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
-                    short_id, rc, time.time() - start,
-                )
-                await _post_response(
-                    client, room_id, output, rc, session_id, mention,
-                    max_message_length,
-                    reply_target=ack_event_id or event.event_id,
-                    db=db, thread_root_id=thread_root_id,
-                )
-            return
-        log.info(
-            "action=orphaned_reply event_id=%s thread_root=%s",
-            event.event_id, thread_root,
-        )
-
-    # Room-root → resume active session if one exists, otherwise spawn new
-    async with _room_lock:
-        active_row = get_latest_active_session(db)
-        if active_row is not None:
-            # Resume the existing session — same path as a thread reply
-            session_id = active_row["session_id"]
-            thread_root_id = active_row["thread_root_id"]
-            short_id = session_id[:8]
-            log.info(
-                "action=session_resume session_id=%s age_min=%.1f trigger=room_root",
-                short_id,
-                (time.time() - active_row["created_at"]) / 60.0,
-            )
-            # M2: re-fetch under lock — idle_monitor may have retired this session
-            fresh = db.execute(
-                "SELECT * FROM sessions WHERE session_id = ? AND status = 'active'",
-                (session_id,),
-            ).fetchone()
-            if fresh is None:
-                log.info(
-                    "action=session_rolled_over_during_handler session_id=%s",
-                    short_id,
-                )
-                active_row = None  # fall through to spawn
-            else:
-                now = time.time()
-                if now - _last_resume_at < RESUME_RATE_LIMIT_SECONDS:
-                    remaining = int(RESUME_RATE_LIMIT_SECONDS - (now - _last_resume_at))
-                    log.info(
-                        "action=resume_rate_limited session_id=%s wait_s=%d",
-                        short_id, remaining,
-                    )
-                    rate_event_id = await post_message(
-                        client, room_id,
-                        f"{mention} Still processing — retry in {remaining}s.",
-                        reply_to=event.event_id,
-                    )
-                    register_alias(db, rate_event_id, thread_root_id)
-                    return
-                _last_resume_at = now
-                ack_event_id = await post_message(
-                    client, room_id,
-                    f"Thinking... (session {short_id})",
-                    reply_to=event.event_id,
-                )
-                register_alias(db, ack_event_id, thread_root_id)
-                register_alias(db, event.event_id, thread_root_id)
-                start = time.time()
-                needs_handoff = (
-                    not fresh["handoff_injected"]
-                    and fresh["previous_session_id"]
-                )
-                await _typing_on(client, room_id)
-                try:
-                    if needs_handoff:
-                        prev_id = fresh["previous_session_id"]
-                        handoff_path = HANDOFFS_DIR / f"{prev_id}.md"
-                        handoff_text = (
-                            handoff_path.read_text(errors="replace")
-                            if handoff_path.exists() else ""
-                        )
-                        if len(handoff_text.encode()) > 16_000:
-                            handoff_text = (
-                                handoff_text[:16_000] + "\n[…handoff truncated…]"
-                            )
-                        full_message = (
-                            "[Session context — recent conversation summary "
-                            "and last messages:\n"
-                            f"{handoff_text}\n"
-                            "---]\n\n"
-                            f"{stamp(user_message)}"
-                        )
-                        log.info(
-                            "action=continuity_inject session_id=%s prev=%s "
-                            "handoff_bytes=%d",
-                            short_id, prev_id[:8], len(handoff_text),
-                        )
-                        with db:
-                            db.execute(
-                                "UPDATE sessions SET handoff_injected=1 "
-                                "WHERE session_id=?",
-                                (session_id,),
-                            )
-                        rc, output = await spawn_personal(
-                            session_id, full_message, project_dir,
-                            subprocess_timeout,
-                        )
-                    else:
-                        rc, output = await resume_personal(
-                            session_id, stamp(user_message), project_dir,
-                            subprocess_timeout,
-                        )
-                except asyncio.TimeoutError:
-                    log.error("action=resume_timeout session_id=%s", short_id)
-                    timeout_event_id = await post_message(
-                        client, room_id,
-                        f"{mention} Session {short_id} timed out after "
-                        f"{subprocess_timeout}s.",
-                        reply_to=ack_event_id or event.event_id,
-                    )
-                    register_alias(db, timeout_event_id, thread_root_id)
-                    return
-                finally:
-                    await _typing_off(client, room_id)
-                update_token_fill(db, session_id, project_dir, context_window)
-                log.info(
-                    "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
-                    short_id, rc, time.time() - start,
-                )
-                await _post_response(
-                    client, room_id, output, rc, session_id, mention,
-                    max_message_length,
-                    reply_target=ack_event_id or event.event_id,
-                    db=db, thread_root_id=thread_root_id,
-                )
-                return
-
-        # No active session → spawn new
+    async with _room_lock(room_id):
         now = time.time()
-        if now - _last_spawn_at < RATE_LIMIT_SECONDS:
-            remaining = int(RATE_LIMIT_SECONDS - (now - _last_spawn_at))
-            log.info("action=rate_limited event_id=%s remaining=%d",
-                     event.event_id, remaining)
-            await post_message(
-                client, room_id,
-                f"{mention} Rate-limited; try again in {remaining}s.",
-                reply_to=event.event_id,
-            )
-            return
-        _last_spawn_at = now
+        last = _last_turn_at.get(room_id, 0.0)
+        if now - last < RATE_LIMIT_SECONDS:
+            return  # silent drop of bursty duplicates; continuous chat needs no nag
+        _last_turn_at[room_id] = now
 
-        session_id = str(uuid.uuid4())
-        short_id = session_id[:8]
-        log.info(
-            "action=session_spawn session_id=%s trigger=new event_id=%s",
-            short_id, event.event_id,
-        )
-        ack_event_id = await post_message(
-            client, room_id,
-            f"Thinking... (session {short_id})",
-            reply_to=event.event_id,
-        )
-        # Persist before spawning — replies can resume even if spawn errors
-        insert_session(db, session_id, event.event_id, room_id)
-        register_alias(db, ack_event_id, event.event_id)
+        sess = get_active_session(db, room_id)
 
-        # v0.4: cold-start memsearch — prepend relevant prior context to first message
-        relevant_memory = _sanitize_memsearch(await query_memsearch(user_message))
-        if relevant_memory:
-            spawn_message = (
-                f"[Relevant prior context:\n{relevant_memory}\n---]\n\n"
-                f"{stamp(user_message)}"
-            )
-            log.info(
-                "action=memsearch_inject session_id=%s bytes=%d",
-                short_id, len(relevant_memory),
-            )
+        # Orphan guard: an active session with zero successful turns means a
+        # prior spawn failed before claude created a resumable session on disk.
+        # Resuming it would fail forever — retire it and open fresh instead.
+        if sess is not None and sess["turn_count"] == 0:
+            mark_session(db, sess["session_id"], "expired", "orphan_no_turn")
+            log.info("action=orphan_retire room=%s session=%s", room_id, sess["session_id"])
+            sess = None
+
+        # Pre-turn roll (idle / nightly).
+        if sess is not None:
+            reason = should_roll_preturn(sess, now)
+            if reason:
+                roll_over(db, deploy, sess, reason)
+                sess = None
+
+        warm_prefix = ""
+        if sess is None:
+            prev = last_rolled_session(db, room_id)
+            prev_id = prev["session_id"] if prev else None
+            warm_prefix = await build_warm_prefix(db, prev_id, deploy)
+            # Cold-start memsearch injection only for a truly fresh chain (no
+            # warm handoff) — when there IS a handoff, that's the context.
+            if not warm_prefix and deploy.get("memsearch_bin"):
+                mem = _sanitize_injection(await query_memsearch(deploy, user_message))
+                if mem:
+                    warm_prefix = f"[Relevant prior context:\n{mem}\n---]\n\n"
+                    log.info("action=memsearch_inject room=%s bytes=%d", room_id, len(mem))
+            session_id = str(uuid.uuid4())
+            insert_session(db, session_id, room_id, event.event_id, prev_id)
+            resume = False
+            last_used = prev["last_used_at"] if prev else None
+            log.info("action=open_session room=%s session=%s prev=%s",
+                     room_id, session_id, prev_id)
         else:
-            spawn_message = stamp(user_message)
+            session_id = sess["session_id"]
+            resume = True
+            last_used = sess["last_used_at"]
+            log.info("action=resume room=%s session=%s", room_id, session_id)
 
-        start = time.time()
+        tag = datetime_tag(now, last_used, deploy.get("timezone", "America/New_York"))
+        prompt = f"{warm_prefix}{tag}\n{user_message}"
+
+        ack = await post_message(client, room_id, f"… ({session_id[:8]})",
+                                 reply_to=event.event_id)
+        register_alias(db, ack, session_id, room_id)
+
         await _typing_on(client, room_id)
         try:
-            rc, output = await spawn_personal(
-                session_id, spawn_message, project_dir,
-                subprocess_timeout,
+            rc, stdout = await run_claude(
+                deploy, room_id, session_id=session_id, resume=resume,
+                prompt=prompt, timeout=timeout,
             )
         except asyncio.TimeoutError:
-            log.error("action=spawn_timeout session_id=%s", short_id)
-            timeout_event_id = await post_message(
-                client, room_id,
-                f"{mention} Session {short_id} timed out after "
-                f"{subprocess_timeout}s.",
-                reply_to=ack_event_id or event.event_id,
-            )
-            register_alias(db, timeout_event_id, event.event_id)
+            log.error("action=turn_timeout room=%s session=%s", room_id, session_id)
+            await post_message(client, room_id,
+                               f"{mention_user} Turn timed out after {timeout}s.",
+                               reply_to=ack or event.event_id)
             return
         finally:
             await _typing_off(client, room_id)
-        update_token_fill(db, session_id, project_dir, context_window)
-        log.info(
-            "action=claude_exit session_id=%s rc=%d elapsed_s=%.1f",
-            short_id, rc, time.time() - start,
-        )
-        await _post_response(
-            client, room_id, output, rc, session_id, mention,
-            max_message_length,
-            reply_target=ack_event_id or event.event_id,
-            db=db, thread_root_id=event.event_id,
-        )
+
+        parsed = parse_stream_json(stdout)
+        response = parsed["text"] or "(no output)"
+        if rc != 0 or parsed["is_error"]:
+            # Keep verbose detail in PM2 logs only — not in Matrix (L1: OE-02).
+            log.error("action=turn_error room=%s session=%s rc=%d response_preview=%r",
+                      room_id, session_id, rc, response[:200])
+            response = f"turn error (rc={rc}) — check manager logs"
+
+        # Persist the turn (self-captured store) + advance session fill.
+        current = get_session(db, session_id)
+        turn_index = current["turn_count"] if current else 0
+        insert_turn(db, session_id, room_id, turn_index,
+                    user_message, parsed["text"], ",".join(parsed["tools"]),
+                    parsed["fill"])
+        update_session_after_turn(db, session_id, parsed["fill"])
+        log.info("action=turn_complete room=%s session=%s rc=%d fill=%d tools=%d",
+                 room_id, session_id, rc, parsed["fill"], len(parsed["tools"]))
+
+        for i, chunk in enumerate(split_on_paragraphs(response, max_message_length)):
+            text = f"{mention_user} {chunk}" if i == 0 else chunk
+            ev = await post_message(client, room_id, text, reply_to=ack or event.event_id)
+            register_alias(db, ev, session_id, room_id)
+
+        # Post-turn roll (token budget — the primary trigger).
+        if parsed["fill"] >= ROLLOVER_BUDGET:
+            fresh = get_session(db, session_id)
+            if fresh and fresh["state"] == "active":
+                roll_over(db, deploy, fresh, "token_budget")
 
 
 # ---------------------------------------------------------------------------
 # Polling loop
 # ---------------------------------------------------------------------------
 
-async def poll_loop(
-    client: AsyncClient,
-    config: dict,
-    db: sqlite3.Connection,
-    operator_user_id: str,
-    room_id: str,
-) -> None:
-    poll_interval = int(config.get("poll_interval_seconds", 5))
-    max_message_length = int(config.get("max_message_length", 4000))
-    project_dir = config["project_dir"]
-    subprocess_timeout = int(config.get(
-        "subprocess_timeout_seconds", DEFAULT_SUBPROCESS_TIMEOUT
-    ))
-    context_window = int(config.get(
-        "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS
-    ))
+async def poll_loop(client: AsyncClient, config: dict, db: sqlite3.Connection) -> None:
+    trusted_sender = config.get("trusted_sender", "")
+    mention_user = config.get("mention_user", "")
+    poll_interval = config.get("poll_interval_seconds", 5)
+    max_message_length = config.get("max_message_length", 4000)
+    timeout = config.get("subprocess_timeout_seconds", SUBPROCESS_TIMEOUT_SECONDS)
+
+    deploy = config["deployment"]
+    room_id = deploy["room_id"]
 
     since = get_since(db)
-
-    # Cold-start seeding: capture next_batch without processing recent events,
-    # preventing re-spawns for messages already answered before this run.
     if since is None:
         seed = await client.sync(timeout=0, since=None, full_state=False)
         if isinstance(seed, SyncResponse):
@@ -1344,10 +1262,7 @@ async def poll_loop(
         else:
             log.warning("action=poll_seed_error response=%s", type(seed).__name__)
 
-    log.info(
-        "action=poll_start room=%s operator=%s since=%s",
-        room_id, operator_user_id, since,
-    )
+    log.info("action=poll_start room=%s since=%s", room_id, since)
 
     while True:
         try:
@@ -1358,30 +1273,16 @@ async def poll_loop(
                 continue
             since = resp.next_batch
             set_since(db, since)
-
-            global _last_cleanup_at
-            now_ts = time.time()
-            if now_ts - _last_cleanup_at > CLEANUP_INTERVAL_SECONDS:
-                retention_days = int(config.get("session_retention_days", 30))
-                cleanup_old_sessions(db, retention_days)
-                _last_cleanup_at = now_ts
-
-            for joined_room_id, room_info in resp.rooms.join.items():
-                if joined_room_id != room_id:
+            for rid, room_info in resp.rooms.join.items():
+                if rid != room_id:
                     continue
                 for event in room_info.timeline.events:
                     if not isinstance(event, RoomMessageText):
                         continue
                     task = asyncio.create_task(handle_event(
-                        client=client,
-                        room_id=room_id,
-                        event=event,
-                        operator_user_id=operator_user_id,
-                        project_dir=project_dir,
-                        db=db,
-                        max_message_length=max_message_length,
-                        subprocess_timeout=subprocess_timeout,
-                        context_window=context_window,
+                        client=client, room_id=room_id, event=event, deploy=deploy,
+                        trusted_sender=trusted_sender, mention_user=mention_user,
+                        max_message_length=max_message_length, db=db, timeout=timeout,
                     ))
                     _handlers.add(task)
                     task.add_done_callback(_handlers.discard)
@@ -1397,80 +1298,57 @@ async def poll_loop(
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _room_lock
-
-    homeserver, user_id, token, room_id = get_credentials()
+    homeserver, user_id, token = get_credentials()
     config = load_config()
+    deploy = config["deployment"]
 
-    # Override room_id from env if config doesn't match — env wins
-    config_room_id = (config.get("room_id") or "").strip()
-    if config_room_id and config_room_id != room_id:
-        log.warning(
-            "action=room_id_mismatch env=%s config=%s using=env",
-            room_id, config_room_id,
-        )
-
-    operator_user_id = config.get("operator_user_id", "").strip()
-    if not operator_user_id:
-        log.error("action=startup_error missing_var=operator_user_id_in_config")
-        sys.exit(1)
-
-    project_dir = config.get("project_dir", "").strip()
-    if not project_dir or not Path(project_dir).is_dir():
-        log.error("action=startup_error reason=project_dir_missing path=%s",
-                  project_dir)
-        sys.exit(1)
+    # Config-driven rollover budget (default tuned for the design model, Sonnet).
+    global ROLLOVER_BUDGET
+    ROLLOVER_BUDGET = int(config.get("rollover_budget", ROLLOVER_BUDGET))
+    log.info("action=config model=%s rollover_budget=%d",
+             deploy.get("model") or "(host default)", ROLLOVER_BUDGET)
 
     db = open_db()
     init_db(db)
-
-    _room_lock = asyncio.Lock()
 
     client = AsyncClient(homeserver, user_id)
     client.access_token = token
     client.user_id = user_id
 
-    log.info(
-        "action=startup user_id=%s homeserver=%s room_id=%s project_dir=%s",
-        user_id, homeserver, room_id, project_dir,
-    )
+    log.info("action=startup user_id=%s homeserver=%s name=%s",
+             user_id, homeserver, deploy.get("name"))
 
-    if config.get("startup_notify"):
+    if config.get("startup_notification", True):
         try:
-            await post_message(
-                client, room_id,
-                "personal-agent v0.4 online.",
-            )
+            await post_message(client, deploy["room_id"],
+                               f"{deploy.get('name','agent')} manager online.")
         except Exception:
             log.exception("action=startup_notify_error")
 
-    idle_task = asyncio.create_task(idle_monitor(db, config))
+    retention_days = int(config.get("session_retention_days", RETENTION_DAYS))
+    harvest_task = asyncio.create_task(idle_harvest_loop(db, deploy))
+    cleanup_task = asyncio.create_task(cleanup_loop(db, retention_days))
     try:
-        await poll_loop(client, config, db, operator_user_id, room_id)
+        await poll_loop(client, config, db)
     finally:
-        idle_task.cancel()
-        try:
-            await idle_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        for proc_key, proc in list(_active_processes.items()):
+        for t in (harvest_task, cleanup_task):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        for rid, proc in list(_active_processes.items()):
             try:
                 proc.send_signal(signal.SIGTERM)
-                log.info("action=shutdown_sigterm session=%s pid=%s",
-                         proc_key[:8], proc.pid)
+                log.info("action=shutdown_sigterm room=%s pid=%s", rid, proc.pid)
             except ProcessLookupError:
                 pass
         if _handlers:
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*_handlers, return_exceptions=True),
-                    timeout=10,
-                )
+                    asyncio.gather(*_handlers, return_exceptions=True), timeout=10)
             except asyncio.TimeoutError:
-                log.warning(
-                    "action=shutdown_handlers_timeout outstanding=%d",
-                    len(_handlers),
-                )
+                log.warning("action=shutdown_handlers_timeout outstanding=%d", len(_handlers))
         db.close()
         await client.close()
 

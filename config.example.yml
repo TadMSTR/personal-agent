@@ -1,42 +1,69 @@
-# personal-agent runtime config (template — copy to config.yml and fill in)
-# config.yml is gitignored; never commit live credentials or room IDs.
+# personal-agent — example deployment config.
+# Copy to config.<name>.yml and point PERSONAL_AGENT_CONFIG at it (see start.sh).
+# Secrets do NOT live here — bot credentials come from env vars (see start.sh):
+#   PERSONAL_AGENT_HOMESERVER / PERSONAL_AGENT_USER_ID / PERSONAL_AGENT_ACCESS_TOKEN
 
-# Polling cadence and chunking.
+# Who may drive the conversation. Messages from anyone else are silently ignored.
+trusted_sender: "@you:example.org"
+mention_user: "@you:example.org"
+
 poll_interval_seconds: 5
 max_message_length: 4000
+subprocess_timeout_seconds: 600
+startup_notification: true
 
-# Logical Matrix room the agent watches. Override per-deployment.
-room_id: "!ROOMID:your.homeserver"
+# Roll the session at this input-token fill. The default suits the design model
+# (Sonnet: 200k window, ~167k auto-compact trigger). If you pin a different model
+# below (e.g. a 1M-window model), re-derive this against that window.
+rollover_budget: 130000
 
-# Operator mxid — only messages from this sender are processed. Other senders
-# are silently dropped at the gate (security flag B in dispatcher.py).
-operator_user_id: "@your-user:your.homeserver"
+deployment:
+  # Persona name — used in notes/tags and the startup notice. This file is the
+  # only place the name lives; nothing in the code hard-codes it.
+  name: "harlock"
 
-# claude-code project directory the agent runs from.
-project_dir: "/home/user/.claude/projects/personal-agent"
+  # Pin the model the rollover budget assumes. Omit to inherit the host default
+  # (NOT recommended — the budget math depends on a known context window).
+  model: "claude-sonnet-4-6"
 
-# Claude subprocess timeout (seconds). Personal-agent conversations can run
-# longer than dispatcher tasks; default is generous.
-subprocess_timeout_seconds: 1800
+  # The room this agent lives in (one continuous conversation).
+  room_id: "!yourRoomId:example.org"
 
-# Retention for session metadata in SQLite (days).
+  # Local timezone for the per-turn [time: …] tag.
+  timezone: "America/New_York"
+
+  # Path to the claude binary the manager launches.
+  claude_bin: "/usr/local/bin/claude"
+
+  # If set, launch the session as this OS user via:
+  #   sudo -n -u <agent_user> -- <claude_bin> ...
+  # Requires a NOPASSWD sudoers grant scoped to exactly that command.
+  # Omit (or leave empty) to run claude as the same user as the manager.
+  agent_user: "agent-harlock"
+
+  # cwd for the launched session — where the agent's CLAUDE.md / .mcp.json /
+  # settings.json live. claude derives its project (and transcript path) from this.
+  project_dir: "/home/agent-harlock/.claude/projects/harlock"
+
+  # Agent's home — only used by !mirror to locate local transcripts. In an
+  # isolated deployment the manager cannot read these (0600); !mirror no-ops.
+  agent_home: "/home/agent-harlock"
+
+  # Durable rollover handoff notes (manager-owned, memsearch-indexed working tier).
+  working_note_dir: "/home/you/.claude/memory/agents/harlock/working"
+
+  # Idle-harvest session notes (manager-owned, memsearch-indexed session tier).
+  session_note_dir: "/home/you/.claude/memory/agents/harlock/session"
+
+  # Rollover handoff summarization via Ollama. Omit ollama_model to disable and
+  # always use the raw last-N-turn tail (the plan's fallback).
+  ollama_url: "http://localhost:11434"
+  ollama_model: "summarize:latest"
+  ollama_timeout: 60
+
+  # Cold-start memsearch injection: absolute path to the memsearch CLI the
+  # manager can run. Omit to disable injection.
+  memsearch_bin: "/home/you/.local/bin/memsearch"
+
+# Prune rolled/expired sessions (and their turns) after this many days.
 session_retention_days: 30
-
-# v0.2 — idle-based session rollover.
-# When an active session has not received a message for idle_threshold_seconds,
-# the idle monitor generates a handoff summary, retires the session, and
-# allocates a new session_id. Continuity is injected on the next user message.
-idle_threshold_seconds: 1800
-idle_check_interval_seconds: 60
-
-# v0.3 — context window size used as the denominator for token_fill_pct.
-# Sized for the current Claude context window; lift if Anthropic ships a larger one.
-context_window_tokens: 200000
-
-# v0.3 — nightly rollover cutoff (local hour, 0–23). Sessions created before
-# the most recent occurrence of this hour are rolled over so each new day
-# starts with fresh sessions. Defaults to 4 (4:00 AM local).
-nightly_rollover_hour: 4
-
-# Optional: post a startup notification to the room when the manager comes up.
-startup_notify: true

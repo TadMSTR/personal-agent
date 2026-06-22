@@ -1,14 +1,9 @@
-.venv/
 venv/
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-config.yml
-.env
+.pytest_cache/
+config.local.yml
 *.env
+sessions.db*
 core.*
 *.core
-*.db
-*.db-wal
-*.db-shm

@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
+# Launch the personal-agent manager. Loads bot credentials from an env file
+# (chmod 600), selects the deployment config, and execs the daemon in its venv.
 set -euo pipefail
 
-ENV_FILE="/home/ted/.claude-secrets/matrix-personal.env"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SECRETS_FILE="${PERSONAL_AGENT_ENV:-$HOME/.claude-secrets/personal-agent.env}"
 
-if [[ ! -f "$ENV_FILE" ]]; then
-    echo "ERROR: credentials file not found: $ENV_FILE" >&2
-    exit 1
+if [[ ! -f "$SECRETS_FILE" ]]; then
+  echo "Missing credentials file: $SECRETS_FILE" >&2
+  exit 1
 fi
-
-set -o allexport
 # shellcheck disable=SC1090
-source "$ENV_FILE"
-set +o allexport
+set -a; source "$SECRETS_FILE"; set +a
 
-exec /home/ted/repos/personal/personal-agent/.venv/bin/python \
-    /home/ted/repos/personal/personal-agent/manager.py
+export PERSONAL_AGENT_CONFIG="${PERSONAL_AGENT_CONFIG:-$REPO_DIR/config.harlock.yml}"
+
+exec "$REPO_DIR/venv/bin/python" "$REPO_DIR/manager.py"

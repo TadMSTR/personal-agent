@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.5.0] — 2026-06-22
+
+Isolation-ready rewrite. Runs against a hardened, OS-isolated agent user
+(`agent-harlock`) whose session transcripts are unreadable (`0600`) by the
+manager. The v0.4.x design read the agent's JSONL transcripts for fill estimation
+and handoff tails — incompatible with isolation. Continuity is now entirely
+self-captured from stream-json stdout.
+
+### Security (v0.5 audit — personal-agent-hardening-2026-06)
+- FW-01: all note files (rollover handoff, session harvest) now written via
+  `_atomic_write()` — opens `.tmp` at `O_CREAT|0o600`, writes, then atomic rename.
+  Eliminates the partial-file visibility and brief world-readable permissions
+  window from the prior `write_text()` pattern.
+- SC-02: added `core.*` and `*.core` to `.gitignore`.
+- OE-02 (L1): `claude` exit error and stderr detail now routed to `log.error` only;
+  Matrix receives a generic `turn error (rc=N) — check manager logs` message.
+  Prevents internal filesystem paths from leaking into the room.
+- `_sanitize_injection()` applied to all three prompt-injection sources: Ollama
+  summary, raw-tail handoff, and cold-start memsearch results. Drops lines
+  containing `---]` so adversarial content cannot break out of the injection block.
+
+### Added
+- Launch via `sudo -n -u <agent_user> -- <claude_bin>` (config `deployment.agent_user`).
+- `--model` pin (config `deployment.model`, default `claude-sonnet-4-6`) so the
+  rollover budget matches a known context window.
+- stream-json fill: sum `input + cache_read + cache_creation` from the `result`
+  event's usage instead of scanning transcripts.
+- Self-captured `turns` table (built from stream-json stdout) feeds the handoff
+  tail, `!recap`, and idle-harvest — no transcript access required.
+- Session state machine (`active → rolled → expired`) + DB-enforced
+  `one_active_per_room` partial unique index.
+- Ollama handoff summarization (`summarize:latest`) with raw-last-N-turn fallback.
+- Per-turn `[time: … | +Δ since last]` datetime tag.
+- `!recap` (walks `prev_session_id` across rollovers), `!sessions`, `!cancel`,
+  `!mirror`, `!help`.
+- Idle-harvest loop → memsearch session tier; cold-archive of the agent's raw
+  transcripts handed to a scoped `User=agent-harlock` systemd janitor
+  (`scripts/harlock-archive` + units) — the file owner does its own housekeeping.
+- Config-driven `rollover_budget` and `session_retention_days`.
+- Unit suite (17 tests) covering the verification checklist.
+
+### Ported from v0.4.x
+- `--dangerously-skip-permissions` (headless MCP), typing indicators
+  (`typing_state=` kwarg), cold-start memsearch injection (+ `---]` breakout
+  sanitization), minimal subprocess env, message-length guard, retention cleanup,
+  orphan-session guard (active session with zero successful turns is retired, not
+  resumed).
+
+### Corrected design assumption
+- The v0.4 build plan assumed a ~167k auto-compact trigger via
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW=180000`. That holds for the design model
+  (Sonnet, 200k window) but NOT for the host default `opus-4-8[1m]` (1M window),
+  where the pin is ineffective and a single tool-loading turn can exceed 200k.
+  The manager now pins the model explicitly so the budget math is valid. Verified
+  empirically: a tool-heavy turn measured ~142k on Sonnet (rolls after, below the
+  167k trigger); a trivial turn ~20k.
+
 ## [0.4.2] — 2026-05-08
 
 ### Changed

@@ -1,0 +1,22 @@
+# Cold-archive Harlock's idle session transcripts (Phase 7 step 2).
+# Runs AS agent-harlock so it can read the agent's own 0600 JSONL files — the
+# manager (running as ted) deliberately cannot. Install to /etc/systemd/system/
+# (sysadmin; needs root). Pair with harlock-archive.timer.
+[Unit]
+Description=Harlock session transcript cold-archive
+Documentation=https://gitea.tadmstr.me/forge/personal-agent
+
+[Service]
+Type=oneshot
+User=agent-harlock
+Group=forge-agents
+ExecStart=/usr/local/bin/harlock-archive --older-than 7d
+# Least privilege: this unit only needs its own home.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/agent-harlock/.claude
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX

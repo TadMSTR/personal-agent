@@ -1,0 +1,12 @@
+# Fire the Harlock transcript cold-archive daily. Install to
+# /etc/systemd/system/ and `systemctl enable --now harlock-archive.timer`.
+[Unit]
+Description=Daily Harlock session transcript cold-archive
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

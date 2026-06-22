@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""harlock-archive — cold-archive idle session transcripts (Phase 7 step 2).
+
+Runs AS the agent user (e.g. agent-harlock) via a systemd timer, so it has
+native access to the agent's own 0600 JSONL transcripts and home — the manager
+(a different, less-privileged-for-this user) cannot and must not.
+
+Stateless and mtime-based: gzip-move every *.jsonl older than --older-than out of
+the project transcript dir into the cold archive. No coupling to the manager's
+sessions.db — the manager already owns the recall-relevant content in its `turns`
+table; this is pure disk housekeeping for the agent's raw transcripts.
+
+Usage:
+  harlock-archive [--older-than 7d] [--project-dir DIR] [--archive-dir DIR] [--dry-run]
+
+Defaults assume the Harlock layout under the invoking user's home.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+DEFAULT_PROJECT_DIR = (
+    Path.home() / ".claude" / "projects"
+    / "-home-agent-harlock--claude-projects-harlock"
+)
+DEFAULT_ARCHIVE_DIR = Path.home() / ".claude" / "archive" / "sessions"
+
+
+def parse_duration(s: str) -> int:
+    s = s.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s and s[-1] in units:
+        return int(float(s[:-1]) * units[s[-1]])
+    return int(float(s))  # bare number = seconds
+
+
+def archive_one(src: Path, archive_dir: Path, dry_run: bool) -> bool:
+    dst = archive_dir / (src.name + ".gz")
+    if dst.exists():
+        # Already archived under this name; drop the stale source.
+        if not dry_run:
+            src.unlink(missing_ok=True)
+        return False
+    if dry_run:
+        print(f"[dry-run] would archive {src.name} -> {dst}")
+        return True
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    with src.open("rb") as f_in, gzip.open(tmp, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    os.replace(tmp, dst)
+    os.chmod(dst, 0o600)
+    src.unlink(missing_ok=True)
+    print(f"archived {src.name} -> {dst}")
+    return True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--older-than", default="7d",
+                    help="age threshold, e.g. 7d / 48h / 3600 (default 7d)")
+    ap.add_argument("--project-dir", default=str(DEFAULT_PROJECT_DIR))
+    ap.add_argument("--archive-dir", default=str(DEFAULT_ARCHIVE_DIR))
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    cutoff = time.time() - parse_duration(args.older_than)
+    project_dir = Path(args.project_dir)
+    archive_dir = Path(args.archive_dir)
+
+    if not project_dir.is_dir():
+        print(f"project dir not found: {project_dir}", file=sys.stderr)
+        return 1
+    if not args.dry_run:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    for path in sorted(project_dir.glob("*.jsonl")):
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            if archive_one(path, archive_dir, args.dry_run):
+                count += 1
+        except OSError as e:
+            print(f"skip {path.name}: {e}", file=sys.stderr)
+    print(f"done: {count} file(s) archived (older_than={args.older_than})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

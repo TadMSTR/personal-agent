@@ -1,0 +1,40 @@
+# personal-agent — Harlock deployment on forge.
+# Secrets are NOT here — bot creds come from ~/.claude-secrets/personal-agent.env
+# (sourced by start.sh). This file is safe to commit.
+
+trusted_sender: "@ted:helmforge.me"
+mention_user: "@ted:helmforge.me"
+
+poll_interval_seconds: 5
+max_message_length: 4000
+subprocess_timeout_seconds: 600
+startup_notification: true
+
+# Roll the session at this input-token fill. 130k sits below Sonnet's ~167k
+# auto-compact trigger (200k window, CLAUDE_CODE_AUTO_COMPACT_WINDOW=180000).
+# Must be re-derived if `model` below changes (e.g. a 1M-window model).
+rollover_budget: 130000
+
+deployment:
+  name: "harlock"
+  room_id: "!lWjcxtuQyuJYiNjvIv:helmforge.me"
+  timezone: "America/New_York"
+  claude_bin: "/usr/local/bin/claude"
+  # Pin the model the rollover math assumes. Without this the host default
+  # (opus 4.8 [1m], 1M window) is used and the 130k budget is wrong.
+  model: "claude-sonnet-4-6"
+  agent_user: "agent-harlock"
+  project_dir: "/home/agent-harlock/.claude/projects/harlock"
+  agent_home: "/home/agent-harlock"
+  working_note_dir: "/home/ted/.claude/memory/agents/harlock/working"
+  session_note_dir: "/home/ted/.claude/memory/agents/harlock/session"
+
+  # Rollover handoff: summarize the tail via Ollama, fall back to raw tail.
+  ollama_url: "http://localhost:11434"
+  ollama_model: "summarize:latest"
+  ollama_timeout: 60
+
+  # Cold-start memsearch injection (manager runs as ted; CLI on ted's path).
+  memsearch_bin: "/home/ted/.local/bin/memsearch"
+
+session_retention_days: 30
