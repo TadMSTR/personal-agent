@@ -440,7 +440,11 @@ def _launch_args(deploy: dict, *, session_id: str, resume: bool, prompt: str) ->
     base: list[str]
     if agent_user:
         # NOPASSWD sudoers grant is scoped to exactly claude_bin as agent_user.
-        base = ["sudo", "-n", "-u", agent_user, "--", claude_bin]
+        # --chdir sets CWD as the target user (requires CWD=* in the sudoers rule;
+        # sudo ≥1.9.3). This ensures transcripts land in the correct project bucket
+        # without requiring ted to have traverse permission on the agent's home.
+        base = ["sudo", "-n", "-u", agent_user,
+                "--chdir", deploy["project_dir"], "--", claude_bin]
     else:
         base = [claude_bin]
     # Pin the model from config so the rollover math (which assumes a known
@@ -471,7 +475,9 @@ async def run_claude(
         stdin=asyncio.subprocess.DEVNULL,  # prompt is an argv positional; closing
         stdout=asyncio.subprocess.PIPE,    # stdin avoids claude's 3s stdin wait and
         stderr=asyncio.subprocess.PIPE,    # any block when run headless under PM2.
-        cwd=deploy["project_dir"],
+        # For isolated deployments (agent_user set), CWD is handled by
+        # sudo --chdir (manager may not have traverse permission on agent's home).
+        cwd=None if deploy.get("agent_user") else deploy.get("project_dir"),
         env=_minimal_env(),
     )
     _active_processes[room_id] = proc
