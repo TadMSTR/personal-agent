@@ -806,6 +806,8 @@ async def build_warm_prefix(
         "[Continuity handoff — this is a fresh session continuing an ongoing "
         "conversation. The prior context was rolled to stay below the compaction "
         "limit; it was NOT lost. Use memsearch/qmd to recall anything older.\n"
+        "Identity anchor at project_dir/SOUL.md — injected separately at session start.\n"
+        "Reference docs in Gitea host-forge/harlock (fetch via githost-mcp if needed).\n"
         f"{body}\n---]\n\n[Current message:]\n"
     )
 
@@ -1173,6 +1175,18 @@ async def handle_event(
             prev = last_rolled_session(db, room_id)
             prev_id = prev["session_id"] if prev else None
             warm_prefix = await build_warm_prefix(db, prev_id, deploy)
+            # SOUL.md — unconditional identity anchor injected first on every new session
+            soul_section = ""
+            project_dir = deploy.get("project_dir", "")
+            if project_dir:
+                soul_path = Path(project_dir) / "SOUL.md"
+                if soul_path.exists():
+                    try:
+                        soul_content = soul_path.read_text(encoding="utf-8")
+                        soul_section = f"[Identity anchor — SOUL.md]\n{soul_content}\n---\n\n"
+                        log.info("action=soul_inject room=%s bytes=%d", room_id, len(soul_section))
+                    except OSError as e:
+                        log.warning("action=soul_inject_failed room=%s err=%s", room_id, e)
             # Cold-start memsearch injection only for a truly fresh chain (no
             # warm handoff) — when there IS a handoff, that's the context.
             if not warm_prefix and deploy.get("memsearch_bin"):
@@ -1180,6 +1194,7 @@ async def handle_event(
                 if mem:
                     warm_prefix = f"[Relevant prior context:\n{mem}\n---]\n\n"
                     log.info("action=memsearch_inject room=%s bytes=%d", room_id, len(mem))
+            warm_prefix = soul_section + warm_prefix
             session_id = str(uuid.uuid4())
             insert_session(db, session_id, room_id, event.event_id, prev_id)
             resume = False
