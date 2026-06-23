@@ -47,6 +47,12 @@ backstop) effectively never fires.
   | `token_budget` | `fill ≥ rollover_budget` | post-turn (primary) |
   | `idle` | idle > 1h **and** fill < 40% of budget | pre-turn |
   | `nightly` | last used before 04:00 UTC | pre-turn |
+- **SOUL.md identity anchor.** At every new session open, the manager reads
+  `project_dir/SOUL.md` and prepends it to the first prompt — before any warm
+  handoff or memsearch injection. Place the file at the path configured in
+  `deployment.project_dir`. Absent or unreadable: silently skipped, no startup
+  failure. The rollover handoff preamble also includes a two-line pointer to
+  SOUL.md so the agent can locate identity context after a rollover.
 - **Warm-context bridge.** On rollover the manager writes a durable handoff note
   (memsearch-indexed) and, on the next message, **inlines** the handoff into the
   new session's first prompt. The handoff is an **Ollama summary** of the tail
