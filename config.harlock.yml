@@ -30,7 +30,7 @@ deployment:
   session_note_dir: "/home/ted/.claude/memory/agents/harlock/session"
 
   # Rollover handoff: summarize the tail via Ollama, fall back to raw tail.
-  ollama_url: "http://localhost:11434"
+  ollama_url: "http://localhost:11435"
   ollama_model: "summarize:latest"
   ollama_timeout: 60
 
