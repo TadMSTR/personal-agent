@@ -662,7 +662,7 @@ def _ollama_summarize_sync(deploy: dict, conversation: str) -> str:
     }).encode()
     req = urllib.request.Request(
         url.rstrip("/") + "/api/generate", data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-Queue-Priority": "high"},
     )
     try:
         with urllib.request.urlopen(req, timeout=deploy.get("ollama_timeout", 60)) as resp:
